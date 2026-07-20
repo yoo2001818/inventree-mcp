@@ -53,7 +53,15 @@ export class InvenTreeClient {
       throw new InvenTreeError("Only absolute /api/ paths are allowed");
     }
 
-    const url = new URL(path, `${this.credentials.baseUrl}/`);
+    if (path.includes("?") || path.includes("#")) {
+      throw new InvenTreeError("Put query parameters in the query object, not the API path");
+    }
+    const baseUrl = new URL(`${this.credentials.baseUrl}/`);
+    const apiPrefix = `${baseUrl.pathname.replace(/\/$/, "")}/api/`.replace(/\/{2,}/g, "/");
+    const url = new URL(path.slice(1), baseUrl);
+    if (url.origin !== baseUrl.origin || !url.pathname.startsWith(apiPrefix)) {
+      throw new InvenTreeError("API path escaped the configured InvenTree /api/ namespace");
+    }
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value === undefined || value === null || value === "") continue;
       if (Array.isArray(value)) {

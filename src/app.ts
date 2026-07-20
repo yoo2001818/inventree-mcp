@@ -1,10 +1,10 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Config } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { OAuthService } from "./oauth.js";
 import { JsonStore } from "./store.js";
+import { ChatGptStreamableTransport } from "./transport.js";
 
 export interface AppServices {
   config: Config;
@@ -19,7 +19,20 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
 
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
-  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'none'"],
+          styleSrc: ["'unsafe-inline'"],
+          formAction: ["'self'"],
+          baseUri: ["'none'"],
+          frameAncestors: ["'none'"],
+        },
+      },
+      referrerPolicy: { policy: "no-referrer" },
+    }),
+  );
   app.use(express.json({ limit: "1mb" }));
   app.use(oauth.router);
 
@@ -58,9 +71,13 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
 
   app.post("/mcp", authenticate, async (req, res) => {
     const server = createMcpServer(oauth);
-    const transport = new StreamableHTTPServerTransport({
+    const transport = new ChatGptStreamableTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
+    });
+    res.on("close", () => {
+      void transport.close();
+      void server.close();
     });
     try {
       await server.connect(transport);
@@ -74,11 +91,6 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
           id: null,
         });
       }
-    } finally {
-      res.on("close", () => {
-        void transport.close();
-        void server.close();
-      });
     }
   });
   app.get("/mcp", authenticate, (_req, res) => res.status(405).json({ error: "method_not_allowed" }));

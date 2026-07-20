@@ -7,9 +7,15 @@ import type { OAuthService } from "./oauth.js";
 const READ_SECURITY = [{ type: "oauth2", scopes: ["inventree.read"] }];
 const WRITE_SECURITY = [{ type: "oauth2", scopes: ["inventree.write"] }];
 
+class BridgeScopeError extends Error {
+  constructor(readonly scope: string) {
+    super(`OAuth scope ${scope} is required`);
+  }
+}
+
 function requireAuth(authInfo: AuthInfo | undefined, scope: string): AuthInfo {
-  if (!authInfo) throw new Error("Authentication required");
-  if (!authInfo.scopes.includes(scope)) throw new Error(`OAuth scope ${scope} is required`);
+  if (!authInfo) throw new BridgeScopeError(scope);
+  if (!authInfo.scopes.includes(scope)) throw new BridgeScopeError(scope);
   return authInfo;
 }
 
@@ -25,8 +31,16 @@ function result(data: unknown, message: string) {
   };
 }
 
-function errorResult(error: unknown) {
+function errorResult(error: unknown, oauth: OAuthService) {
   const details = error instanceof InvenTreeError ? error.details : undefined;
+  const challenge =
+    error instanceof BridgeScopeError
+      ? {
+          "mcp/www_authenticate": [
+            `Bearer resource_metadata="${oauth.config.publicUrl.origin}/.well-known/oauth-protected-resource", error="insufficient_scope", error_description="${error.message}", scope="${error.scope}"`,
+          ],
+        }
+      : undefined;
   return {
     isError: true,
     structuredContent: { error: (error as Error).message, details },
@@ -38,14 +52,15 @@ function errorResult(error: unknown) {
           : (error as Error).message,
       },
     ],
+    ...(challenge ? { _meta: challenge } : {}),
   };
 }
 
-async function safely(callback: () => Promise<unknown>, message: string) {
+async function safely(oauth: OAuthService, callback: () => Promise<unknown>, message: string) {
   try {
     return result(await callback(), message);
   } catch (error) {
-    return errorResult(error);
+    return errorResult(error, oauth);
   }
 }
 
@@ -75,6 +90,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async ({ query, category, active, limit, offset }, extra) =>
       safely(
+        oauth,
         () =>
           clientFor(oauth, extra.authInfo, "inventree.read").get("/api/part/", {
             search: query,
@@ -98,6 +114,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async ({ part_id }, extra) =>
       safely(
+        oauth,
         () => clientFor(oauth, extra.authInfo, "inventree.read").get(`/api/part/${part_id}/`),
         `Retrieved part ${part_id}.`,
       ),
@@ -122,6 +139,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async (input, extra) =>
       safely(
+        oauth,
         () => clientFor(oauth, extra.authInfo, "inventree.read").get("/api/stock/", input),
         "Retrieved matching stock items.",
       ),
@@ -144,6 +162,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async (input, extra) =>
       safely(
+        oauth,
         () => clientFor(oauth, extra.authInfo, "inventree.read").get("/api/stock/location/", input),
         "Retrieved stock locations.",
       ),
@@ -164,6 +183,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async ({ part_id, limit, offset }, extra) =>
       safely(
+        oauth,
         () =>
           clientFor(oauth, extra.authInfo, "inventree.read").get("/api/bom/", {
             part: part_id,
@@ -189,6 +209,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async ({ path, query }, extra) =>
       safely(
+        oauth,
         () => clientFor(oauth, extra.authInfo, "inventree.read").get(path, query),
         `Read ${path}.`,
       ),
@@ -218,6 +239,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
     async ({ method, path, body }, extra) =>
       safely(
+        oauth,
         () => clientFor(oauth, extra.authInfo, "inventree.write").write(method, path, body),
         `${method} ${path} completed.`,
       ),

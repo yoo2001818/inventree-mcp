@@ -19,7 +19,9 @@ function required(name: string, value: string | undefined): string {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const publicUrl = new URL(required("PUBLIC_URL", env.PUBLIC_URL));
-  publicUrl.pathname = publicUrl.pathname.replace(/\/$/, "");
+  if (publicUrl.pathname !== "/" || publicUrl.search || publicUrl.hash) {
+    throw new Error("PUBLIC_URL must be an origin without a path, query, or fragment");
+  }
   if (publicUrl.protocol !== "https:" && publicUrl.hostname !== "localhost") {
     throw new Error("PUBLIC_URL must use HTTPS (except localhost during development)");
   }
@@ -30,11 +32,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("ENCRYPTION_KEY must be exactly 32 bytes encoded as base64");
   }
 
+  const ownerPassword = required("OWNER_PASSWORD", env.OWNER_PASSWORD);
+  if (Buffer.byteLength(ownerPassword, "utf8") < 16) {
+    throw new Error("OWNER_PASSWORD must be at least 16 bytes long");
+  }
+
   return {
     publicUrl,
     resourceUrl: new URL("/mcp", publicUrl).toString(),
     port: Number.parseInt(env.PORT ?? "3000", 10),
-    ownerPassword: required("OWNER_PASSWORD", env.OWNER_PASSWORD),
+    ownerPassword,
     encryptionKey,
     dataFile: env.DATA_FILE ?? "/data/state.json",
     accessTokenTtlSeconds: Number.parseInt(env.ACCESS_TOKEN_TTL_SECONDS ?? "3600", 10),

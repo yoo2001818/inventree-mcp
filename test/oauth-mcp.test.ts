@@ -38,7 +38,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     publicUrl: new URL("https://mcp.example.test"),
     resourceUrl: "https://mcp.example.test/mcp",
     port: 3000,
-    ownerPassword: "owner-secret",
+    ownerPassword: "owner-secret-long-enough",
     encryptionKey: Buffer.alloc(32, 7),
     dataFile: join(directory, "state.json"),
     accessTokenTtlSeconds: 3600,
@@ -66,7 +66,9 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.deepEqual(metadata.body.code_challenge_methods_supported, ["S256"]);
 
     const response = await request(app).post("/mcp").send({}).expect(401);
-    assert.match(response.header["www-authenticate"], /oauth-protected-resource/);
+    const challenge = response.header["www-authenticate"];
+    assert.ok(challenge);
+    assert.match(challenge, /oauth-protected-resource/);
   });
 
   it("completes DCR, authorization-code PKCE, token exchange, and an MCP tool call", async () => {
@@ -104,7 +106,9 @@ describe("OAuth-protected InvenTree MCP", () => {
         owner_password: config.ownerPassword,
       })
       .expect(303);
-    const callback = new URL(approval.header.location);
+    const callbackLocation = approval.header.location;
+    assert.ok(callbackLocation);
+    const callback = new URL(callbackLocation);
     assert.equal(callback.searchParams.get("state"), "expected-state");
     const code = callback.searchParams.get("code");
     assert.ok(code);
@@ -143,7 +147,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       method: "tools/list",
       params: {},
     });
-    assert.ok(tools.body.result.tools.some((tool: { name: string }) => tool.name === "search_parts"));
+    const searchTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "search_parts");
+    assert.ok(searchTool);
+    assert.deepEqual(searchTool._meta.securitySchemes, [
+      { type: "oauth2", scopes: ["inventree.read"] },
+    ]);
+    assert.deepEqual(searchTool.securitySchemes, [
+      { type: "oauth2", scopes: ["inventree.read"] },
+    ]);
 
     const search = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",
@@ -153,6 +164,26 @@ describe("OAuth-protected InvenTree MCP", () => {
     });
     assert.equal(search.body.result.structuredContent.data.results[0].pk, 42);
     assert.equal(search.body.result.structuredContent.data.results[0].query, "10k");
+
+    const refusedWrite = await mcpRequest(token.body.access_token, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "inventree_write",
+        arguments: {
+          method: "PATCH",
+          path: "/api/part/42/",
+          body: { description: "changed" },
+          confirmation: "I confirm this InvenTree mutation",
+        },
+      },
+    });
+    assert.equal(refusedWrite.body.result.isError, true);
+    assert.match(
+      refusedWrite.body.result._meta["mcp/www_authenticate"][0],
+      /insufficient_scope/,
+    );
 
     const refresh = await request(app)
       .post("/oauth/token")
@@ -167,7 +198,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.notEqual(refresh.body.refresh_token, token.body.refresh_token);
   });
 
-  async function mcpRequest(accessToken: string, body: unknown) {
+  async function mcpRequest(accessToken: string, body: object) {
     return request(app)
       .post("/mcp")
       .set("Authorization", `Bearer ${accessToken}`)

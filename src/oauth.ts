@@ -25,6 +25,8 @@ function parseScopes(value: unknown): string[] {
 
 export class OAuthService {
   readonly router: Router;
+  private readonly failedOwnerAttempts = new Map<string, { count: number; resetAt: number }>();
+  private readonly registrationAttempts = new Map<string, { count: number; resetAt: number }>();
 
   constructor(
     readonly config: Config,
@@ -108,6 +110,20 @@ export class OAuthService {
   }
 
   private registerClient(req: Request, res: Response): void {
+    const attemptKey = req.ip ?? req.socket.remoteAddress ?? "unknown";
+    const attempts = this.registrationAttempts.get(attemptKey);
+    if (attempts && attempts.count >= 30 && attempts.resetAt > Date.now()) {
+      oauthError(res, 429, "temporarily_unavailable", "Dynamic client registration rate limit reached");
+      return;
+    }
+    this.registrationAttempts.set(attemptKey, {
+      count: (attempts?.resetAt ?? 0) > Date.now() ? attempts!.count + 1 : 1,
+      resetAt: Date.now() + 60 * 60_000,
+    });
+    if (Object.keys(this.store.snapshot.clients).length >= 1_000) {
+      oauthError(res, 429, "temporarily_unavailable", "Registered OAuth client limit reached");
+      return;
+    }
     const redirectUris = req.body?.redirect_uris;
     if (!Array.isArray(redirectUris) || redirectUris.length === 0 || redirectUris.length > 10) {
       oauthError(res, 400, "invalid_client_metadata", "redirect_uris must be a non-empty array");
@@ -179,10 +195,21 @@ export class OAuthService {
         }),
       );
 
+    const attemptKey = req.ip ?? req.socket.remoteAddress ?? "unknown";
+    const attempts = this.failedOwnerAttempts.get(attemptKey);
+    if (attempts && attempts.count >= 10 && attempts.resetAt > Date.now()) {
+      renderError("Too many failed owner-password attempts. Try again later.");
+      return;
+    }
     if (!secureEqual(String(req.body.owner_password ?? ""), this.config.ownerPassword)) {
+      this.failedOwnerAttempts.set(attemptKey, {
+        count: (attempts?.resetAt ?? 0) > Date.now() ? attempts!.count + 1 : 1,
+        resetAt: Date.now() + 15 * 60_000,
+      });
       renderError("Incorrect bridge owner password.");
       return;
     }
+    this.failedOwnerAttempts.delete(attemptKey);
 
     try {
       const inventreeUrl = normalizeInvenTreeUrl(String(req.body.inventree_url ?? ""));
@@ -245,7 +272,7 @@ export class OAuthService {
     if (
       stored.clientId !== String(req.body.client_id ?? "") ||
       stored.redirectUri !== String(req.body.redirect_uri ?? "") ||
-      stored.resource !== String(req.body.resource ?? stored.resource) ||
+      stored.resource !== String(req.body.resource ?? "") ||
       pkceS256(String(req.body.code_verifier ?? "")) !== stored.codeChallenge
     ) {
       oauthError(res, 400, "invalid_grant", "Authorization code validation failed");
@@ -262,7 +289,7 @@ export class OAuthService {
       oauthError(res, 400, "invalid_grant", "Invalid or expired refresh token");
       return;
     }
-    if (req.body.resource && String(req.body.resource) !== stored.resource) {
+    if (String(req.body.resource ?? "") !== stored.resource) {
       oauthError(res, 400, "invalid_target", "Refresh token is not valid for that resource");
       return;
     }
@@ -340,6 +367,13 @@ export class OAuthService {
     }
     if (url.protocol !== "https:" && url.hostname !== "localhost") {
       throw new Error("Redirect URI must use HTTPS");
+    }
+    if (
+      url.origin === "https://chatgpt.com" &&
+      !url.pathname.startsWith("/connector/oauth/") &&
+      url.pathname !== "/connector_platform_oauth_redirect"
+    ) {
+      throw new Error("ChatGPT redirect URI is not a recognized connector callback");
     }
   }
 }
