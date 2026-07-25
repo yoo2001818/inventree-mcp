@@ -44,7 +44,7 @@ openssl rand -base64 32  # use as ENCRYPTION_KEY
 openssl rand -base64 32  # use as OWNER_PASSWORD
 ```
 
-Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Set `INVENTREE_URL` to the one InvenTree instance reachable from the bridge container, such as `http://inventree-server:8000`. End users cannot override this URL; changing it and restarting the service moves all existing credential links to the new instance. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
+Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Set `INVENTREE_URL` to the one InvenTree instance reachable from the bridge container, such as `http://inventree-server:8000`. End users cannot override this URL; changing it and restarting the service moves all existing credential links to the new instance. `ALLOWED_MCP_ORIGINS` is a comma-separated allowlist for requests that include an `Origin` header. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
 
 Start the service:
 
@@ -80,15 +80,12 @@ ChatGPT's current MCP authorization flow expects protected-resource metadata, OA
 
 ```bash
 npm install
-PUBLIC_URL=http://localhost:3000 \
-INVENTREE_URL=http://localhost:8000 \
-ENCRYPTION_KEY="$(openssl rand -base64 32)" \
-OWNER_PASSWORD="$(openssl rand -base64 32)" \
-DATA_FILE=./data/state.json \
 npm run dev
 ```
 
-For local OAuth testing, add the inspector's exact redirect origin to `ALLOWED_REDIRECT_ORIGINS`. The default permits only `https://chatgpt.com`.
+`npm run dev` loads the Git-ignored `.env` file. Copy `.env.example` to `.env` and set its values if the file does not exist yet.
+
+For local OAuth testing, add the inspector's exact origin to both `ALLOWED_REDIRECT_ORIGINS` and `ALLOWED_MCP_ORIGINS`. The default permits only `https://chatgpt.com`. Local development binds to `127.0.0.1` by default; Docker Compose overrides `BIND_HOST` to `0.0.0.0` inside the container while publishing the port only on host loopback.
 
 Run the checks:
 
@@ -105,6 +102,7 @@ The end-to-end test starts a fake InvenTree server and exercises DCR, authorizat
 - This is a compact single-user authorization server, not a general identity platform.
 - `OWNER_PASSWORD` gates authorization and is rate-limited in memory after failed attempts.
 - `INVENTREE_URL` fixes the upstream instance for every linked credential; authorization requests cannot select another host.
+- MCP requests with an `Origin` header are rejected with HTTP 403 unless the exact origin appears in `ALLOWED_MCP_ORIGINS`.
 - DCR accepts only callback origins listed in `ALLOWED_REDIRECT_ORIGINS`; `https://chatgpt.com` is the default.
 - Registrations are rate-limited in memory and capped to prevent unbounded persistent state. For a hardened deployment, also rate-limit at the reverse proxy and optionally restrict the endpoint to OpenAI's published egress ranges.
 - InvenTree tokens are encrypted with AES-256-GCM. OAuth bearer and refresh tokens are stored only as SHA-256 hashes.

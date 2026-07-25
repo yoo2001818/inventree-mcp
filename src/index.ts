@@ -4,8 +4,8 @@ import { loadConfig, ownerPasswordFingerprint } from "./config.js";
 const config = loadConfig();
 const { app } = createApp(config);
 
-const server = app.listen(config.port, "0.0.0.0", () => {
-  console.log(`InvenTree MCP listening on port ${config.port}`);
+const server = app.listen(config.port, config.bindHost, () => {
+  console.log(`InvenTree MCP listening on ${config.bindHost}:${config.port}`);
   console.log(`Public MCP endpoint: ${config.resourceUrl}`);
   console.log(`Owner password fingerprint: ${ownerPasswordFingerprint(config)}`);
 });

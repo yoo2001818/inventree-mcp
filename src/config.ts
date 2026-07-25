@@ -5,6 +5,7 @@ export interface Config {
   publicUrl: URL;
   resourceUrl: string;
   inventreeUrl: string;
+  bindHost: string;
   port: number;
   ownerPassword: string;
   encryptionKey: Buffer;
@@ -12,11 +13,26 @@ export interface Config {
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   allowedRedirectOrigins: string[];
+  allowedMcpOrigins: string[];
 }
 
 function required(name: string, value: string | undefined): string {
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+
+function exactOrigins(name: string, value: string): string[] {
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .map((origin) => {
+      const url = new URL(origin);
+      if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== origin) {
+        throw new Error(`${name} entries must be exact HTTP(S) origins without paths`);
+      }
+      return origin;
+    });
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -40,21 +56,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const inventreeUrl = normalizeInvenTreeUrl(required("INVENTREE_URL", env.INVENTREE_URL));
+  const allowedRedirectOrigins = (env.ALLOWED_REDIRECT_ORIGINS ?? "https://chatgpt.com")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
 
   return {
     publicUrl,
     resourceUrl: new URL("/mcp", publicUrl).toString(),
     inventreeUrl,
+    bindHost: env.BIND_HOST?.trim() || "127.0.0.1",
     port: Number.parseInt(env.PORT ?? "3000", 10),
     ownerPassword,
     encryptionKey,
     dataFile: env.DATA_FILE ?? "/data/state.json",
     accessTokenTtlSeconds: Number.parseInt(env.ACCESS_TOKEN_TTL_SECONDS ?? "3600", 10),
     refreshTokenTtlSeconds: Number.parseInt(env.REFRESH_TOKEN_TTL_SECONDS ?? "2592000", 10),
-    allowedRedirectOrigins: (env.ALLOWED_REDIRECT_ORIGINS ?? "https://chatgpt.com")
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean),
+    allowedRedirectOrigins,
+    allowedMcpOrigins: exactOrigins(
+      "ALLOWED_MCP_ORIGINS",
+      env.ALLOWED_MCP_ORIGINS ?? "https://chatgpt.com",
+    ),
   };
 }
 

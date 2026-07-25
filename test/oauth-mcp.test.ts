@@ -38,6 +38,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     publicUrl: new URL("https://mcp.example.test"),
     resourceUrl: "https://mcp.example.test/mcp",
     inventreeUrl: "http://127.0.0.1",
+    bindHost: "127.0.0.1",
     port: 3000,
     ownerPassword: "owner-secret-long-enough",
     encryptionKey: Buffer.alloc(32, 7),
@@ -45,6 +46,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     accessTokenTtlSeconds: 3600,
     refreshTokenTtlSeconds: 86_400,
     allowedRedirectOrigins: ["https://chatgpt.com"],
+    allowedMcpOrigins: ["https://chatgpt.com"],
   };
 
   before(async () => {
@@ -71,6 +73,13 @@ describe("OAuth-protected InvenTree MCP", () => {
     const challenge = response.header["www-authenticate"];
     assert.ok(challenge);
     assert.match(challenge, /oauth-protected-resource/);
+
+    const invalidOrigin = await request(app)
+      .get("/mcp")
+      .set("Origin", "https://attacker.example")
+      .set("Accept", "text/event-stream")
+      .expect(403);
+    assert.equal(invalidOrigin.body.error.message, "Invalid Origin header: https://attacker.example");
   });
 
   it("completes DCR, authorization-code PKCE, token exchange, and an MCP tool call", async () => {
@@ -132,12 +141,21 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.ok(token.body.access_token);
     assert.ok(token.body.refresh_token);
 
+    const getResponse = await request(app)
+      .get("/mcp")
+      .set("Authorization", `Bearer ${token.body.access_token}`)
+      .set("Origin", "https://chatgpt.com")
+      .set("Accept", "text/event-stream")
+      .expect(405);
+    assert.equal(getResponse.header.allow, "POST");
+    assert.equal(getResponse.body.error.message, "Method not allowed.");
+
     const initialize = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
       params: {
-        protocolVersion: "2025-06-18",
+        protocolVersion: "2025-11-25",
         capabilities: {},
         clientInfo: { name: "test", version: "1" },
       },
@@ -206,6 +224,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       .post("/mcp")
       .set("Authorization", `Bearer ${accessToken}`)
       .set("Accept", "application/json, text/event-stream")
+      .set("MCP-Protocol-Version", "2025-11-25")
       .send(body)
       .expect(200);
   }

@@ -33,6 +33,18 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
       referrerPolicy: { policy: "no-referrer" },
     }),
   );
+  app.use("/mcp", (req, res, next) => {
+    const origin = req.header("origin");
+    if (origin && !config.allowedMcpOrigins.includes(origin)) {
+      res.status(403).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: `Invalid Origin header: ${origin}` },
+        id: null,
+      });
+      return;
+    }
+    next();
+  });
   app.use(express.json({ limit: "1mb" }));
   app.use(oauth.router);
 
@@ -93,8 +105,16 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
       }
     }
   });
-  app.get("/mcp", authenticate, (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
-  app.delete("/mcp", authenticate, (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
+  const methodNotAllowed = (_req: Request, res: Response) => {
+    res.set("Allow", "POST").status(405).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Method not allowed." },
+      id: null,
+    });
+  };
+  app.get("/mcp", authenticate, methodNotAllowed);
+  app.delete("/mcp", authenticate, methodNotAllowed);
+  app.all("/mcp", authenticate, methodNotAllowed);
 
   return { app, services: { config, store, oauth } satisfies AppServices };
 }

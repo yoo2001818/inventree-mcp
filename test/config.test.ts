@@ -14,6 +14,19 @@ describe("configuration", () => {
     const config = loadConfig(validEnvironment);
 
     assert.equal(config.inventreeUrl, "https://inventree.example.test/instance");
+    assert.equal(config.bindHost, "127.0.0.1");
+    assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com"]);
+  });
+
+  it("loads explicit bind and MCP Origin settings", () => {
+    const config = loadConfig({
+      ...validEnvironment,
+      BIND_HOST: "0.0.0.0",
+      ALLOWED_MCP_ORIGINS: "https://chatgpt.com,http://localhost:6274",
+    });
+
+    assert.equal(config.bindHost, "0.0.0.0");
+    assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com", "http://localhost:6274"]);
   });
 
   it("requires the fixed InvenTree URL", () => {
@@ -27,6 +40,17 @@ describe("configuration", () => {
     assert.throws(
       () => loadConfig({ ...validEnvironment, INVENTREE_URL: "ftp://inventree.example.test" }),
       /InvenTree URL must use http:\/\/ or https:\/\//,
+    );
+  });
+
+  it("rejects MCP Origin entries containing paths", () => {
+    assert.throws(
+      () =>
+        loadConfig({
+          ...validEnvironment,
+          ALLOWED_MCP_ORIGINS: "https://chatgpt.com/connector",
+        }),
+      /ALLOWED_MCP_ORIGINS entries must be exact HTTP\(S\) origins without paths/,
     );
   });
 });
