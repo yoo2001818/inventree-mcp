@@ -36,35 +36,23 @@ Read tools return compact Markdown plus minimal normalized structured data. Cate
 | `scan_barcode` | Resolve a barcode without changing inventory |
 | `inventree_get` | Advanced raw read-only `/api/` escape hatch |
 
-Dedicated write tools append stable steps to a short-lived shared plan. Staging and plan editing do not mutate InvenTree and do not require user confirmation. Review the complete plan once, obtain confirmation, then call `commit_inventory_plan(plan_id, expected_version)`. Commit re-reads relevant upstream state, executes the frozen plan serially, and retains its result for safe retries.
+`create_inventory_plan` accepts an entire ordered mutation workflow in one call. Its typed actions perform the same workflow-specific validation as the former individual staging tools, while request-local `{ "step": "...", "output": "..." }` references connect dependent creates without extra MCP round trips. Plan creation does not mutate InvenTree and does not require user confirmation. The creation response is the complete canonical review; obtain confirmation once, then call `commit_inventory_plan(plan_id, expected_version)`. Commit re-reads relevant upstream state, executes the frozen plan serially, and retains its result for safe retries.
 
 | Write tool | Purpose |
 | --- | --- |
-| `create_part_with_stock` | Create a part and optional initial stock after duplicate checks |
-| `update_part` | Change useful home-inventory part metadata |
+| `create_inventory_plan` | Validate and stage one or many typed inventory actions as a complete plan |
 | `prepare_part_image_upload` | Create an expiring browser/PUT upload URL and `upload_ref` |
 | `get_part_image_upload_status` | Check whether a temporary upload is ready to stage |
-| `set_part_image` | Stage a multipart part-image replacement from a temporary upload |
-| `receive_stock` | Add newly acquired quantity or create a stock item |
-| `consume_stock` | Remove used/discarded quantity with an explicit allocation |
-| `move_stock` | Move stock while preserving total quantity |
-| `count_stock` | Reconcile recorded quantities with a physical count |
-| `set_stock_status` | Mark stock OK, damaged, lost, quarantined, and so on |
-| `create_part_category` / `update_part_category` | Organize the part hierarchy |
-| `create_stock_location` / `update_stock_location` | Organize the physical hierarchy |
-| `print_labels` | Resolve a template and prepare a printer side effect |
 | `review_inventory_plan` | Show the consolidated plan with immutable step IDs and output refs |
-| `open_inventory_plan_review` | Open an optional interactive extended-confirmation app |
-| `remove_inventory_plan_step` | Remove a step, rejecting dependents unless cascade is explicit |
 | `discard_inventory_plan` | Discard temporary plan state without changing InvenTree |
 | `commit_inventory_plan` | Revalidate and commit the once-confirmed plan |
 | `inventree_write` | Optional advanced raw POST/PATCH/PUT escape hatch; no DELETE |
 
+The typed actions inside `create_inventory_plan` are `create_part_with_stock`, `update_part`, `set_part_image`, `receive_stock`, `consume_stock`, `move_stock`, `count_stock`, `set_stock_status`, `create_part_category`, `update_part_category`, `create_stock_location`, `update_stock_location`, and `print_labels`. These action names are not separately callable MCP tools.
+
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
 
-Part-image bytes never enter MCP JSON arguments or the persisted plan store. Call `prepare_part_image_upload` to receive an expiring, credential-scoped `upload_ref` and capability URL. A person can open that URL and choose a file, while a native client can `PUT` raw PNG, JPEG, GIF, or extended WebP bytes to the same URL without an OAuth header. The capability token is unguessable, short-lived, and omitted from HTTP access logs. After upload, pass the already-known reference to `set_part_image`, review the shared plan normally, and commit once. For reads, `get_part_image` returns thumbnails and previews immediately as base64 MCP image content; only `variant: "original"` returns a short-lived direct-download URL and MCP resource link. `IMAGE_UPLOAD_MAX_BYTES` and `IMAGE_MAX_PIXELS` configure the in-memory bounds.
-
-When the user explicitly asks for extended or detailed confirmation, call `open_inventory_plan_review(plan_id)` instead of relying only on the Markdown review. MCP Apps-capable hosts render an inline plan UI with every change, outputs, operation counts, a partial-failure warning, an acknowledgement checkbox, and a commit button. The button calls the existing version-checked `commit_inventory_plan`; the app never receives OAuth credentials. Hosts without MCP Apps support still receive the complete Markdown fallback and can use the ordinary confirmation flow.
+Part-image bytes never enter MCP JSON arguments or the persisted plan store. Call `prepare_part_image_upload` to receive an expiring, credential-scoped `upload_ref` and capability URL. A person can open that URL and choose a file, while a native client can `PUT` raw PNG, JPEG, GIF, or extended WebP bytes to the same URL without an OAuth header. The capability token is unguessable, short-lived, and omitted from HTTP access logs. After upload, pass the already-known reference to a `set_part_image` action inside `create_inventory_plan`, review the returned complete plan, and commit once. For reads, `get_part_image` returns thumbnails and previews immediately as base64 MCP image content; only `variant: "original"` returns a short-lived direct-download URL and MCP resource link. `IMAGE_UPLOAD_MAX_BYTES` and `IMAGE_MAX_PIXELS` configure the in-memory bounds.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
 

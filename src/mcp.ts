@@ -4,21 +4,19 @@ import type { OAuthService } from "./oauth.js";
 import type { PartImageUploads } from "./partImages.js";
 import { clientFor, READ_SECURITY, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import { registerReadTools } from "./readTools.js";
-import { registerPlanReviewApp } from "./planReviewApp.js";
 import { registerWriteTools } from "./writeTools.js";
 
 export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUploads): McpServer {
   const server = new McpServer(
-    { name: "inventree-mcp", version: "0.2.0" },
+    { name: "inventree-mcp", version: "0.3.0" },
     {
       instructions:
-        "Home parts and stock only. Stage mutations without confirmation, copy server-issued refs, review once, then commit only after the user confirms. Use open_inventory_plan_review only when the user asks for extended or detailed confirmation.",
+        "Home parts and stock only. Put the complete ordered mutation workflow in one create_inventory_plan call, using {step, output} for dependencies. Its response is the canonical review; commit only after one user confirmation.",
     },
   );
 
   registerReadTools(server, oauth, imageUploads);
   registerWriteTools(server, oauth, imageUploads);
-  registerPlanReviewApp(server, oauth);
 
   server.registerTool(
     "inventree_get",
@@ -46,7 +44,7 @@ export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUplo
       {
         title: "Write to a raw InvenTree API endpoint",
         description:
-          "Development-only advanced mutation escape hatch. Prefer dedicated workflow tools and their preview/commit plans. DELETE is intentionally unsupported.",
+          "Development-only advanced mutation escape hatch. Prefer typed create_inventory_plan actions and their preview/commit flow. DELETE is intentionally unsupported.",
         inputSchema: {
           method: z.enum(["POST", "PATCH", "PUT"]),
           path: z.string().startsWith("/api/"),

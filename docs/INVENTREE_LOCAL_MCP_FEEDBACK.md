@@ -39,7 +39,6 @@ It also covered these non-destructive mutation-planning workflows:
 - consolidated plan review;
 - idempotent operation replay;
 - stale plan-version rejection;
-- dependent-step removal rejection;
 - plan discard.
 
 `commit_inventory_plan`, a successful physical barcode scan, and actual label
@@ -289,5 +288,20 @@ All eight recommendations were implemented in the following pass:
 - only the first staged step repeats append/review guidance;
 - `get_part_image`, expiring upload/download capability URLs, browser and native `PUT` uploads, upload-status checks, `set_part_image`, trusted media downloads, signature and size validation, and multipart commit execution were added without persisting image bytes in plans or capability tokens in access logs.
 - Only relative `/media/` paths are accepted as part images. Static placeholders, absolute URLs, and other namespaces are normalized as no image across part summaries, image retrieval, and replacement previews.
-- `open_inventory_plan_review` provides an optional MCP App for user-requested extended confirmation, including plan details, operation warnings, explicit acknowledgement, and a version-checked commit button, with the full Markdown review retained as a fallback.
 - Generic `/mcp` HTTP access lines are suppressed in favor of semantic `tools/call` console entries containing the tool name and arguments, with secrets and capability tokens redacted.
+
+## Unified Plan Creation Update
+
+The incremental mutation surface was subsequently replaced by one `create_inventory_plan` tool. The former mutation tool names remain as typed action discriminators inside its ordered `steps` array, but are no longer published as separately callable MCP tools. `prepare_part_image_upload`, upload status, plan review, discard, and commit remain standalone because they operate outside initial plan construction.
+
+One request can now express dependent workflows such as category creation, part plus initial stock, and label printing. Each step has an agent-chosen request-local `key`; later entity fields refer to earlier outputs with a structured `{ "step": "part", "output": "stock_item" }` value. The server rejects duplicate keys and unknown or forward references, translates accepted symbols to opaque canonical refs, and returns the whole reviewed plan plus an informational alias mapping.
+
+The redesign also changes safety and latency behavior:
+
+- action arguments do not expose `plan_id`, `expected_version`, or per-step operation IDs;
+- the top-level `operation_id` idempotently identifies the complete plan;
+- any validation failure discards temporary partially staged plan state;
+- the successful creation response is already the canonical review, so normal workflows require only plan creation followed by one confirmed commit;
+- immutable server-issued step IDs and refs remain authoritative for review, removal, dependency protection, and commit;
+- formal part units are normally omitted and are checked against `/api/units/all/` before plan creation when explicitly supplied;
+- upstream commit errors retain sanitized field-level validation details, HTTP status, failed step ID, and completed-operation counts.

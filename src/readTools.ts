@@ -395,8 +395,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
           throw notFound(
             "part_image",
             { supplied_id: input.part_id },
-            "set_part_image",
-            `Part #${input.part_id} does not have an image. Upload one before staging set_part_image.`,
+            "create_inventory_plan",
+            `Part #${input.part_id} does not have an image. Upload one, then create a plan containing a set_part_image action.`,
           );
         }
         const name = optionalString(part.name) ?? `Part ${input.part_id}`;

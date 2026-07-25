@@ -432,24 +432,10 @@ describe("OAuth-protected InvenTree MCP", () => {
       "check_stock_levels",
       "get_stock_history",
       "scan_barcode",
-      "create_part_with_stock",
-      "update_part",
+      "create_inventory_plan",
       "prepare_part_image_upload",
       "get_part_image_upload_status",
-      "set_part_image",
-      "receive_stock",
-      "consume_stock",
-      "move_stock",
-      "count_stock",
-      "set_stock_status",
-      "create_part_category",
-      "update_part_category",
-      "create_stock_location",
-      "update_stock_location",
-      "print_labels",
       "review_inventory_plan",
-      "open_inventory_plan_review",
-      "remove_inventory_plan_step",
       "discard_inventory_plan",
       "commit_inventory_plan",
       "inventree_get",
@@ -458,6 +444,14 @@ describe("OAuth-protected InvenTree MCP", () => {
     }
     assert.ok(!toolNames.includes("inventree_write"));
     assert.ok(!toolNames.includes("get_part_bom"));
+    for (const removed of [
+      "create_part_with_stock", "update_part", "set_part_image", "receive_stock", "consume_stock",
+      "move_stock", "count_stock", "set_stock_status", "create_part_category", "update_part_category",
+      "create_stock_location", "update_stock_location", "print_labels", "remove_inventory_plan_step",
+      "open_inventory_plan_review",
+    ]) {
+      assert.ok(!toolNames.includes(removed), `removed tool still published: ${removed}`);
+    }
     const searchTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "find_parts");
     assert.ok(searchTool);
     assert.deepEqual(searchTool._meta.securitySchemes, [
@@ -466,43 +460,20 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.deepEqual(searchTool.securitySchemes, [
       { type: "oauth2", scopes: ["inventree.read"] },
     ]);
-    const stageTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "receive_stock");
+    const stageTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "create_inventory_plan");
     const commitTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "commit_inventory_plan");
-    const extendedReviewTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "open_inventory_plan_review");
     assert.equal(stageTool.annotations.destructiveHint, false);
     assert.equal(commitTool.annotations.destructiveHint, true);
-    assert.equal(extendedReviewTool.annotations.destructiveHint, false);
-    assert.equal(extendedReviewTool._meta.ui.resourceUri, "ui://inventree/inventory-plan-review.html");
-    assert.equal(extendedReviewTool._meta["ui/resourceUri"], "ui://inventree/inventory-plan-review.html");
-
-    const resources = await mcpRequest(token.body.access_token, {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "resources/list",
-      params: {},
-    });
-    const reviewResource = resources.body.result.resources.find(
-      (resource: { uri: string }) => resource.uri === "ui://inventree/inventory-plan-review.html",
-    );
-    assert.ok(reviewResource);
-    assert.equal(reviewResource.mimeType, "text/html;profile=mcp-app");
-
-    const appResource = await mcpRequest(token.body.access_token, {
-      jsonrpc: "2.0",
-      id: 4,
-      method: "resources/read",
-      params: { uri: "ui://inventree/inventory-plan-review.html" },
-    });
-    assert.equal(appResource.body.result.contents[0].mimeType, "text/html;profile=mcp-app");
-    assert.match(appResource.body.result.contents[0].text, /Inventory plan review/);
-    assert.match(appResource.body.result.contents[0].text, /Commit inventory plan/);
-    const createTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "create_part_with_stock");
-    const categoryIdSchema = createTool.inputSchema.properties.part.properties.category_id;
-    assert.deepEqual(categoryIdSchema.anyOf.map((entry: { type: string }) => entry.type), ["integer", "string"]);
-    const initialNotesSchema = createTool.inputSchema.properties.initial_stock.anyOf
-      .find((entry: { type?: string }) => entry.type === "object").properties.notes;
-    const initialNoteTypes = initialNotesSchema.anyOf?.map((entry: { type: string }) => entry.type) ?? initialNotesSchema.type;
-    assert.deepEqual(initialNoteTypes, ["string", "null"]);
+    const planSchema = JSON.stringify(stageTool.inputSchema);
+    for (const action of [
+      "create_part_with_stock", "update_part", "set_part_image", "receive_stock", "consume_stock",
+      "move_stock", "count_stock", "set_stock_status", "create_part_category", "update_part_category",
+      "create_stock_location", "update_stock_location", "print_labels",
+    ]) {
+      assert.match(planSchema, new RegExp(action), `missing create_inventory_plan action: ${action}`);
+    }
+    assert.match(planSchema, /"step"/);
+    assert.match(planSchema, /"output"/);
     const assertPreciseFields = (schema: unknown, path = "inputSchema") => {
       if (!schema || typeof schema !== "object") return;
       const object = schema as Record<string, unknown>;
@@ -543,12 +514,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 4,
       method: "tools/call",
       params: {
-        name: "receive_stock",
+        name: "create_inventory_plan",
         arguments: {
-          part_id: 42,
-          quantity: 1,
-          location_id: 81,
           operation_id: "refused-write",
+          steps: [{
+            key: "receive",
+            action: "receive_stock",
+            arguments: { part_id: 42, quantity: 1, location_id: 81 },
+          }],
         },
       },
     });
@@ -571,7 +544,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.notEqual(refresh.body.refresh_token, token.body.refresh_token);
   });
 
-  it("stages, revalidates, and commits a shared stock plan idempotently", async () => {
+  it("creates, revalidates, and commits a complete stock plan idempotently", async () => {
     const accessToken = await authorizeToken("inventree.read inventree.write");
 
     const preview = await mcpRequest(accessToken, {
@@ -579,14 +552,20 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 10,
       method: "tools/call",
       params: {
-        name: "receive_stock",
+        name: "create_inventory_plan",
         arguments: {
-          part_id: 42,
-          quantity: 5,
-          location_id: 81,
-          merge: "compatible",
-          notes: "Integration test",
           operation_id: "receive-five",
+          steps: [{
+            key: "receive",
+            action: "receive_stock",
+            arguments: {
+              part_id: 42,
+              quantity: 5,
+              location_id: 81,
+              merge: "compatible",
+              notes: "Integration test",
+            },
+          }],
         },
       },
     });
@@ -600,45 +579,45 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 15,
       method: "tools/call",
       params: {
-        name: "receive_stock",
+        name: "create_inventory_plan",
         arguments: {
-          plan_id: planId,
-          expected_version: 999,
           operation_id: "receive-five",
-          part_id: 42,
-          quantity: 5,
-          location_id: 81,
-          merge: "compatible",
-          notes: "Integration test",
+          steps: [{
+            key: "receive",
+            action: "receive_stock",
+            arguments: {
+              part_id: 42,
+              quantity: 5,
+              location_id: 81,
+              merge: "compatible",
+              notes: "Integration test",
+            },
+          }],
         },
       },
     });
     assert.equal(duplicate.body.result.structuredContent.data.duplicate_operation, true);
+    assert.equal(duplicate.body.result.structuredContent.data.plan_id, planId);
     assert.equal(duplicate.body.result.structuredContent.data.plan_version, planVersion);
 
-    const staleAppend = await mcpRequest(accessToken, {
+    const conflictingReplay = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
       id: 16,
       method: "tools/call",
       params: {
-        name: "receive_stock",
+        name: "create_inventory_plan",
         arguments: {
-          plan_id: planId,
-          expected_version: 999,
-          operation_id: "different-stale-operation",
-          part_id: 42,
-          quantity: 1,
-          location_id: 81,
-          merge: "compatible",
+          operation_id: "receive-five",
+          steps: [{
+            key: "receive",
+            action: "receive_stock",
+            arguments: { part_id: 42, quantity: 6, location_id: 81, merge: "compatible" },
+          }],
         },
       },
     });
-    assert.deepEqual(staleAppend.body.result.structuredContent.data, {
-      status: "conflict",
-      conflict_type: "plan_version",
-      expected_version: 999,
-      current_version: planVersion,
-    });
+    assert.equal(conflictingReplay.body.result.structuredContent.data.status, "conflict");
+    assert.equal(conflictingReplay.body.result.structuredContent.data.conflict_type, "operation_id");
 
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
@@ -663,8 +642,15 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 13,
       method: "tools/call",
       params: {
-        name: "receive_stock",
-        arguments: { part_id: 42, quantity: 1, location_id: 81, merge: "compatible", operation_id: "stale-receive" },
+        name: "create_inventory_plan",
+        arguments: {
+          operation_id: "stale-receive",
+          steps: [{
+            key: "receive",
+            action: "receive_stock",
+            arguments: { part_id: 42, quantity: 1, location_id: 81, merge: "compatible" },
+          }],
+        },
       },
     });
     const stalePlanId = stalePreview.body.result.structuredContent.data.plan_id as string;
@@ -690,41 +676,39 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 20,
       method: "tools/call",
       params: {
-        name: "create_part_with_stock",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "create-new-capacitor",
-          part: { name: "New capacitor", category_id: 15, units: "pcs" },
-          initial_stock: { quantity: 10, location_id: 81, packaging: "cut tape" },
+          steps: [
+            {
+              key: "part",
+              action: "create_part_with_stock",
+              arguments: {
+                part: { name: "New capacitor", category_id: 15, units: "pcs" },
+                initial_stock: { quantity: 10, location_id: 81, packaging: "cut tape" },
+              },
+            },
+            {
+              key: "label",
+              action: "print_labels",
+              arguments: {
+                entity_type: "stock_item",
+                entities: [{ step: "part", output: "stock_item" }],
+                template: "30x15mm",
+                copies: 3,
+              },
+            },
+          ],
         },
       },
     });
     assert.equal(create.body.result.structuredContent.data.status, "staged");
     const planId = create.body.result.structuredContent.data.plan_id as string;
-    const stockRef = create.body.result.structuredContent.data.outputs.find(
-      (output: { name: string }) => output.name === "stock_item",
-    ).ref as string;
-
-    const print = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 21,
-      method: "tools/call",
-      params: {
-        name: "print_labels",
-        arguments: {
-          plan_id: planId,
-          expected_version: 1,
-          operation_id: "print-new-capacitor-stock",
-          entity_type: "stock_item",
-          entities: [{ ref: stockRef }],
-          template: "30x15mm",
-          copies: 3,
-        },
-      },
-    });
-    assert.equal(print.body.result.structuredContent.data.plan_version, 2);
-    assert.match(print.body.result.content[0].text, /New capacitor.*Drawer A3/);
-    assert.match(print.body.result.content[0].text, /Print 3 copies/);
-    assert.doesNotMatch(print.body.result.content[0].text, /Append related steps/);
+    const stockRef = create.body.result.structuredContent.data.aliases.part.stock_item as string;
+    assert.equal(create.body.result.structuredContent.data.plan_version, 2);
+    assert.match(create.body.result.content[0].text, /New capacitor.*Drawer A3/);
+    assert.match(create.body.result.content[0].text, /Print 3 copies/);
+    assert.match(create.body.result.content[0].text, /complete canonical review/i);
 
     const review = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
@@ -733,20 +717,6 @@ describe("OAuth-protected InvenTree MCP", () => {
       params: { name: "review_inventory_plan", arguments: { plan_id: planId } },
     });
     assert.equal(review.body.result.structuredContent.data.steps.length, 2);
-
-    const extendedReview = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 221,
-      method: "tools/call",
-      params: { name: "open_inventory_plan_review", arguments: { plan_id: planId } },
-    });
-    assert.equal(extendedReview.body.result.structuredContent.data.plan_version, 2);
-    assert.equal(extendedReview.body.result.structuredContent.data.operation_count, 3);
-    assert.deepEqual(extendedReview.body.result.structuredContent.data.commit, {
-      tool: "commit_inventory_plan",
-      arguments: { plan_id: planId, expected_version: 2 },
-    });
-    assert.match(extendedReview.body.result.content[0].text, /interactive extended-confirmation view/i);
 
     const printRequestCountBeforeCommit = printedLabelBodies.length;
     const commit = await mcpRequest(accessToken, {
@@ -765,69 +735,37 @@ describe("OAuth-protected InvenTree MCP", () => {
     });
   });
 
-  it("uses immutable step IDs and protects dependent future references during plan edits", async () => {
+  it("rejects invalid future references without retaining a partial plan", async () => {
     const accessToken = await authorizeToken("inventree.read inventree.write");
-    const create = await mcpRequest(accessToken, {
+    const invalidReference = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
-      id: 30,
+      id: 34,
       method: "tools/call",
       params: {
-        name: "create_part_with_stock",
+        name: "create_inventory_plan",
         arguments: {
-          operation_id: "create-removal-test",
-          part: { name: "New capacitor", category_id: 15 },
-          initial_stock: { quantity: 1, location_id: 81 },
+          operation_id: "atomic-invalid-reference",
+          steps: [
+            {
+              key: "part",
+              action: "create_part_with_stock",
+              arguments: { part: { name: "New capacitor", category_id: 15 } },
+            },
+            {
+              key: "label",
+              action: "print_labels",
+              arguments: {
+                entity_type: "stock_item",
+                entities: [{ step: "part", output: "missing_stock" }],
+                template: "30x15mm",
+              },
+            },
+          ],
         },
       },
     });
-    const planId = create.body.result.structuredContent.data.plan_id as string;
-    const producerId = create.body.result.structuredContent.data.step_id as string;
-    const stockRef = create.body.result.structuredContent.data.outputs.find(
-      (output: { name: string }) => output.name === "stock_item",
-    ).ref as string;
-    const print = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 31,
-      method: "tools/call",
-      params: {
-        name: "print_labels",
-        arguments: {
-          plan_id: planId,
-          expected_version: 1,
-          operation_id: "print-removal-test",
-          entity_type: "stock_item",
-          entities: [{ ref: stockRef }],
-          template: "30x15mm",
-        },
-      },
-    });
-    const dependentId = print.body.result.structuredContent.data.step_id as string;
-
-    const refused = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 32,
-      method: "tools/call",
-      params: {
-        name: "remove_inventory_plan_step",
-        arguments: { plan_id: planId, expected_version: 2, step_id: producerId },
-      },
-    });
-    assert.equal(refused.body.result.isError, true);
-    assert.equal(refused.body.result.structuredContent.data.status, "conflict");
-    assert.deepEqual(refused.body.result.structuredContent.data.dependent_step_ids, [dependentId]);
-    assert.match(refused.body.result.content[0].text, new RegExp(dependentId));
-
-    const cascaded = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 33,
-      method: "tools/call",
-      params: {
-        name: "remove_inventory_plan_step",
-        arguments: { plan_id: planId, expected_version: 2, step_id: producerId, cascade: true },
-      },
-    });
-    assert.deepEqual(cascaded.body.result.structuredContent.data.remaining_step_ids, []);
-    assert.equal(cascaded.body.result.structuredContent.data.plan_version, 3);
+    assert.equal(invalidReference.body.result.structuredContent.data.status, "invalid_plan_reference");
+    assert.doesNotMatch(readFileSync(config.dataFile, "utf8"), /atomic-invalid-reference/);
   });
 
   it("accepts numeric ID strings, resolves refs in request paths, and enforces counted tree depth", async () => {
@@ -876,51 +814,39 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 42,
       method: "tools/call",
       params: {
-        name: "create_stock_location",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "create-planned-bin",
-          name: "Planned bin",
-          parent_id: "81",
+          steps: [
+            {
+              key: "location",
+              action: "create_stock_location",
+              arguments: { name: "Planned bin", parent_id: "81" },
+            },
+            {
+              key: "describe",
+              action: "update_stock_location",
+              arguments: {
+                location_id: { step: "location", output: "stock_location" },
+                changes: { description: "Created and updated in one plan" },
+              },
+            },
+            {
+              key: "move",
+              action: "move_stock",
+              arguments: {
+                destination_location_id: { step: "location", output: "stock_location" },
+                stock_item_id: "91",
+              },
+            },
+          ],
         },
       },
     });
     assert.equal(create.body.result.structuredContent.data.status, "staged");
     const planId = create.body.result.structuredContent.data.plan_id as string;
-    const locationRef = create.body.result.structuredContent.data.outputs[0].ref as string;
-
-    const update = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 43,
-      method: "tools/call",
-      params: {
-        name: "update_stock_location",
-        arguments: {
-          plan_id: planId,
-          expected_version: 1,
-          operation_id: "describe-planned-bin",
-          location_id: locationRef,
-          changes: { description: "Created and updated in one plan" },
-        },
-      },
-    });
-    assert.equal(update.body.result.structuredContent.data.plan_version, 2);
-
-    const move = await mcpRequest(accessToken, {
-      jsonrpc: "2.0",
-      id: 44,
-      method: "tools/call",
-      params: {
-        name: "move_stock",
-        arguments: {
-          plan_id: planId,
-          expected_version: 2,
-          operation_id: "move-to-planned-bin",
-          destination_location_id: locationRef,
-          stock_item_id: "91",
-        },
-      },
-    });
-    assert.equal(move.body.result.structuredContent.data.plan_version, 3);
+    const locationRef = create.body.result.structuredContent.data.aliases.location.stock_location as string;
+    assert.equal(create.body.result.structuredContent.data.plan_version, 3);
 
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
@@ -979,10 +905,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 63,
       method: "tools/call",
       params: {
-        name: "create_part_with_stock",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "duplicate-part-probe",
-          part: { name: "10k resistor", category_id: 15 },
+          steps: [{
+            key: "part",
+            action: "create_part_with_stock",
+            arguments: { part: { name: "10k resistor", category_id: 15 } },
+          }],
         },
       },
     });
@@ -1013,10 +943,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 65,
       method: "tools/call",
       params: {
-        name: "create_part_with_stock",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "invalid-localized-unit",
-          part: { name: "Household item", category_id: 15, units: "개" },
+          steps: [{
+            key: "part",
+            action: "create_part_with_stock",
+            arguments: { part: { name: "Household item", category_id: 15, units: "개" } },
+          }],
         },
       },
     });
@@ -1031,11 +965,17 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 66,
       method: "tools/call",
       params: {
-        name: "create_part_with_stock",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "upstream-validation-detail",
-          allow_possible_duplicates: true,
-          part: { name: "Rejected part", category_id: 15 },
+          steps: [{
+            key: "part",
+            action: "create_part_with_stock",
+            arguments: {
+              allow_possible_duplicates: true,
+              part: { name: "Rejected part", category_id: 15 },
+            },
+          }],
         },
       },
     });
@@ -1080,7 +1020,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       status: "not_found",
       entity_type: "part_image",
       supplied_id: 43,
-      suggested_tool: "set_part_image",
+      suggested_tool: "create_inventory_plan",
     });
 
     const image = await mcpRequest(accessToken, {
@@ -1177,8 +1117,15 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 75,
       method: "tools/call",
       params: {
-        name: "set_part_image",
-        arguments: { operation_id: "replace-part-image", part_id: "42", upload_ref: uploadRef },
+        name: "create_inventory_plan",
+        arguments: {
+          operation_id: "replace-part-image",
+          steps: [{
+            key: "image",
+            action: "set_part_image",
+            arguments: { part_id: "42", upload_ref: uploadRef },
+          }],
+        },
       },
     });
     assert.equal(staged.body.result.structuredContent.data.status, "staged");
@@ -1211,10 +1158,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       id: 50,
       method: "tools/call",
       params: {
-        name: "count_stock",
+        name: "create_inventory_plan",
         arguments: {
           operation_id: "no-op-count",
-          counts: [{ stock_item_id: 91, observed_quantity: stockItem.quantity }],
+          steps: [{
+            key: "count",
+            action: "count_stock",
+            arguments: { counts: [{ stock_item_id: 91, observed_quantity: stockItem.quantity }] },
+          }],
         },
       },
     });

@@ -262,58 +262,6 @@ export function reviewPlan(oauth: OAuthService, authInfo: AuthInfo, planId: stri
   };
 }
 
-export function removePlanStep(
-  oauth: OAuthService,
-  authInfo: AuthInfo,
-  planId: string,
-  expectedVersion: number,
-  stepId: string,
-  cascade: boolean,
-): MutationPlan {
-  const owner = credentialsId(authInfo);
-  let updated!: MutationPlan;
-  oauth.store.mutate((data) => {
-    const plan = data.mutationPlans[planId];
-    if (!plan) throw new Error("Inventory plan was not found or expired");
-    if (plan.credentialsId !== owner) throw new Error("Inventory plan belongs to another credential link");
-    if (plan.state !== "staging") throw new Error(`Inventory plan cannot be edited while it is ${plan.state}`);
-    if (plan.version !== expectedVersion) throw versionConflict(expectedVersion, plan.version);
-    const target = plan.steps.find((step) => step.id === stepId);
-    if (!target) throw new Error(`Plan step was not found: ${stepId}`);
-    const removeIds = new Set([stepId]);
-    const removedRefs = new Set(target.outputs.map((output) => output.ref));
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const step of plan.steps) {
-        if (removeIds.has(step.id)) continue;
-        const dependencies = step.requests.flatMap((request) => [
-          ...referencedPlanRefs(request.path),
-          ...referencedPlanRefs(request.body),
-        ]);
-        if (dependencies.some((ref) => removedRefs.has(ref))) {
-          removeIds.add(step.id);
-          step.outputs.forEach((output) => removedRefs.add(output.ref));
-          changed = true;
-        }
-      }
-    }
-    const dependents = [...removeIds].filter((id) => id !== stepId);
-    if (dependents.length && !cascade) {
-      throw new DomainError(
-        { status: "conflict", conflict_type: "dependent_steps", step_id: stepId, dependent_step_ids: dependents },
-        `Cannot remove ${stepId}; dependent steps: ${dependents.join(", ")}. Set cascade=true to remove them too.`,
-      );
-    }
-    plan.steps = plan.steps.filter((step) => !removeIds.has(step.id));
-    plan.version += 1;
-    plan.updatedAt = Date.now();
-    plan.expiresAt = plan.updatedAt + PLAN_TTL_MS;
-    updated = plan;
-  });
-  return updated;
-}
-
 export function discardPlan(oauth: OAuthService, authInfo: AuthInfo, planId: string): void {
   const plan = requireOwnedPlan(oauth, authInfo, planId);
   if (plan.state === "committing") throw new Error("Inventory plan is currently committing");

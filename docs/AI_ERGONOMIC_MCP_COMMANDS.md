@@ -38,13 +38,13 @@ The current domain tools are a safe start, but they still expose InvenTree more 
 7. `get_part_bom` spends a dedicated tool slot on a workflow that is explicitly low priority here.
 8. There is no first-class intake, consumption, movement, stocktake, reorganization, history, or label workflow.
 
-`inventree_get` remains useful as a developer escape hatch. `inventree_write` should eventually be disabled by default once the intended mutations have dedicated tools.
+`inventree_get` remains useful as a developer escape hatch. `inventree_write` should remain disabled by default once intended mutations are represented as typed `create_inventory_plan` actions.
 
 ## Design principles
 
 ### Expose intentions, not endpoints
 
-Use names such as `receive_stock`, `consume_stock`, and `count_stock`, not `post_stock_add` or `patch_stock_item`. Each tool should own the necessary endpoint selection and validation.
+Use semantic action names such as `receive_stock`, `consume_stock`, and `count_stock`, not `post_stock_add` or `patch_stock_item`. These are discriminated action variants inside `create_inventory_plan`, not separately exposed MCP tools. Each private action compiler owns the necessary endpoint selection, validation, summary, checks, requests, and outputs.
 
 ### Keep IDs visible and names readable
 
@@ -306,9 +306,9 @@ The tool should return the same compact entity notation used elsewhere and must 
 
 ## Core write workflows
 
-Each workflow below should be a dedicated tool or a prepare action accepted by a shared mutation planner. The tool must accept IDs, not unresolved names. The assistant can use the read tools to turn user language into IDs first.
+Each workflow below is a typed action accepted by `create_inventory_plan`. Actions accept existing IDs or request-local references, not unresolved names. The assistant can use read tools to turn user language into existing IDs first.
 
-### `create_part_with_stock`
+### Action: `create_part_with_stock`
 
 Purpose: register a new household part, optionally with its initial quantity, location, and a stock-item label.
 
@@ -344,7 +344,7 @@ The public tool schema should not expose assembly, build, purchasing, sales, sup
 
 Implementation may use the part endpoint's `initial_stock` support or create the part and stock item as two validated steps. If upstream cannot make that atomic, the preview should disclose the two steps and the server should report partial failure precisely.
 
-### `update_part`
+### Action: `update_part`
 
 Purpose: rename, recategorize, annotate, deactivate/reactivate, or change home-inventory defaults for an existing part.
 
@@ -359,7 +359,7 @@ Suggested editable fields:
 
 Omitted fields mean "unchanged"; `null` means "clear" where the upstream field allows it. The preview must show a field-level before/after diff.
 
-### `receive_stock`
+### Action: `receive_stock`
 
 Purpose: record newly acquired quantity for an existing part without requiring the model to choose between stock creation and `/api/stock/add/`.
 
@@ -386,7 +386,7 @@ Suggested input:
 
 The preview must state whether the operation will create stock or add to stock item `#N`.
 
-### `consume_stock`
+### Action: `consume_stock`
 
 Purpose: record parts used, discarded, or otherwise removed from available stock.
 
@@ -414,7 +414,7 @@ Consume 3 pcs of 10 kOhm resistor, 1%, 0603 (#203):
 Note: LED controller repair
 ```
 
-### `move_stock`
+### Action: `move_stock`
 
 Purpose: move a quantity, selected stock items, or all stock under a location to another location.
 
@@ -426,7 +426,7 @@ Support three explicit selectors:
 
 The destination must be non-structural. Moving part of a fungible stock item may require an upstream split; that detail should remain inside the MCP implementation. The preview must list every affected stock item and preserve the total quantity.
 
-### `count_stock`
+### Action: `count_stock`
 
 Purpose: reconcile the recorded quantity with a physical count. This maps to the stock-count endpoint rather than guessing a positive or negative adjustment.
 
@@ -446,7 +446,7 @@ Suggested input:
 Preview output must show recorded value, observed value, and delta for every item.
 Unchanged lines are omitted. If every observed quantity is already current, return `already_current` and do not create or modify a plan.
 
-### `set_stock_status`
+### Action: `set_stock_status`
 
 Purpose: mark items as OK, attention needed, damaged, destroyed, lost, quarantined, or returned using semantic enum names rather than integer status codes.
 
@@ -454,21 +454,21 @@ This is lower priority than receive/consume/move/count, but useful for a home la
 
 ## Structure-management tools
 
-Category and location reorganization is common enough to deserve dedicated tools, but less frequent than inventory operations.
+Category and location reorganization is common enough to deserve dedicated action variants, but less frequent than inventory operations.
 
-### `create_part_category`
+### Action: `create_part_category`
 
 Inputs: name, parent ID, description, structural flag, default location ID, default keywords. Validate that no same-name sibling exists. Return the resulting full path and ID.
 
-### `update_part_category`
+### Action: `update_part_category`
 
 Inputs: category ID plus a sparse set of editable fields. Renaming or reparenting must preview the old and new paths and state how many descendant categories and directly assigned parts are affected.
 
-### `create_stock_location`
+### Action: `create_stock_location`
 
 Inputs: name, parent ID, description, structural flag, tags. Validate same-name siblings and return the resulting full path and ID.
 
-### `update_stock_location`
+### Action: `update_stock_location`
 
 Inputs: location ID plus a sparse set of editable fields. Renaming or reparenting must preview the old and new paths and state how many descendant locations and stock items are affected. A location may not become structural while it directly contains stock.
 
@@ -476,7 +476,7 @@ Deletion is intentionally omitted from the MCP surface. Empty obsolete nodes can
 
 ## Label workflow
 
-### `print_labels`
+### Action: `print_labels`
 
 Purpose: print part, stock-item, or stock-location labels without asking the model to remember template IDs or printer plugin strings.
 
@@ -484,7 +484,6 @@ Suggested input:
 
 ```json
 {
-  "operation_id": "print-stock-991",
   "entity_type": "stock_item",
   "entities": [991],
   "template": "30x15mm",
@@ -493,7 +492,7 @@ Suggested input:
 }
 ```
 
-The tool should discover enabled templates from `/api/label/template/`, filtered by `model_type`, and expose human-readable choices. Do not permanently encode the old GPT's template IDs `17` through `22`; IDs are instance-specific and may drift. A deployment configuration may define aliases such as `30x15mm` after validating their model types.
+The action compiler discovers enabled templates from `/api/label/template/`, filtered by `model_type`, and exposes human-readable choices. Do not permanently encode the old GPT's template IDs `17` through `22`; IDs are instance-specific and may drift. A deployment configuration may define aliases such as `30x15mm` after validating their model types.
 
 `copies` is the number of labels printed for each selected entity, from 1 through 99. The connector sends one `/api/label/print/` request and maps `copies` to the top-level request field `number_of_labels`; it must not simulate copies by submitting the same print job repeatedly. This relies on the selected printer plugin exposing that option, as the Zebra label plugin does.
 
@@ -509,7 +508,7 @@ Only relative paths beginning with `/media/` count as part images. Treat every o
 
 For `original`, the connector instead returns an MCP resource link plus a short-lived direct-download URL. This avoids expanding a potentially large original file into base64 inside the MCP response. The URL contains an unguessable capability token, requires no OAuth header, and proxies only the stored credential's trusted InvenTree media path. Capability query strings are excluded from access logs. No variant accepts an arbitrary caller-supplied URL.
 
-### `prepare_part_image_upload`, upload status, and `set_part_image`
+### `prepare_part_image_upload`, upload status, and the `set_part_image` action
 
 `prepare_part_image_upload(filename?)` requires `inventree.write` and returns both an opaque `upload_ref` and an expiring capability URL. The reference is known before any bytes are uploaded, so an agent can continue composing its workflow without inventing a future value. The URL works in two modes:
 
@@ -518,62 +517,81 @@ For `original`, the connector instead returns an MCP resource link plus a short-
 
 The capability URL itself authorizes that single temporary upload, so the browser or native HTTP client does not need access to the MCP OAuth bearer token. An invalid image does not consume the session; a successfully completed upload cannot be replaced through the same URL. `get_part_image_upload_status(upload_ref)` returns `pending` or safe ready metadata without exposing image bytes.
 
-Upload tokens are random, stored only as hashes, scoped to the credential link, excluded from request logs, and expire after 30 minutes. Uploads are signature-checked, byte- and pixel-limited, held only in memory, and never stored in mutation-plan JSON. `set_part_image(part_id, upload_ref, ...plan fields)` stages a normal shared-plan step whose preview includes the existing-image state, filename, MIME type, dimensions, byte size, and replacement side effect. Commit resolves a future part ref if necessary, sends multipart form data to InvenTree, and removes the temporary bytes only after the upstream request succeeds.
+Upload tokens are random, stored only as hashes, scoped to the credential link, excluded from request logs, and expire after 30 minutes. Uploads are signature-checked, byte- and pixel-limited, held only in memory, and never stored in mutation-plan JSON. A `set_part_image` action inside `create_inventory_plan` stages a normal plan step whose preview includes the existing-image state, filename, MIME type, dimensions, byte size, and replacement side effect. Commit resolves a local future-part reference if necessary, sends multipart form data to InvenTree, and removes the temporary bytes only after the upstream request succeeds.
 
 ## Mutation safety protocol
 
-Mutation tools stage steps in one shared plan. Staging changes only temporary bridge state, is non-destructive, and must not ask the user for confirmation. If `plan_id` is omitted, the first staging call creates a plan; later calls append to it.
+`create_inventory_plan` stages an entire ordered workflow in one call. Plan creation changes only temporary bridge state, is non-destructive, and must not ask for confirmation before it is called. Its response contains the complete canonical preview, so the assistant asks for confirmation immediately after that response rather than issuing a mandatory second review call.
 
-Each staged create operation declares outputs and returns opaque plan-scoped references. Later steps can use those references before InvenTree has assigned numeric IDs. For example, a print step can refer to the stock item that an earlier create step will produce.
-
-Future references are local to the `plan_id` supplied on each staging call, so their public representation does not repeat the plan ID. Each step and declared output receives an immutable opaque ID; human-facing step numbers are presentation only and may change when a step is removed. Models only copy server-issued references; they never construct them.
-
-`review_inventory_plan` returns the complete canonical preview. Only then does the assistant ask the user for confirmation.
+Each request step has an agent-chosen `key`, a discriminated `action`, and typed `arguments`. A later step references an earlier declared output with `{ "step": "part", "output": "stock_item" }`. These symbols exist only within the request. The server validates backward ordering and output names, then replaces them with canonical opaque plan refs. Persistent step IDs and refs are always server-issued.
 
 After confirmation, `commit_inventory_plan(plan_id, expected_version)` freezes and revalidates the plan, executes steps serially, resolves future references from earlier results, and returns the final ID mapping.
 
-Only the commit tool is destructive. Staging and plan-editing tools use `destructiveHint: false`; the commit tool uses `destructiveHint: true`. Append operations use idempotency keys and plan versions to prevent duplicate or lost updates.
+Only the commit tool is destructive. Plan creation, review, and discard use `destructiveHint: false`; commit uses `destructiveHint: true`. The top-level `operation_id` makes whole-plan creation idempotent: replaying identical content returns the same plan, while reusing it for different content is an error.
 
 Several InvenTree requests committed from one plan are orchestrated as one reviewed action but are not an upstream database transaction. Partial completion must be reported precisely; automatic rollback must not be assumed. If InvenTree rejects a request, the MCP error must preserve the failed immutable step ID, completed-operation count, HTTP status, and sanitized upstream validation body in structured content. Wrapping an upstream exception must not discard field-level DRF errors such as `{ "units": ["Select a valid choice."] }`.
 
 ### Stable plan identity
 
-A plan has three distinct kinds of identity:
+A plan has four distinct kinds of identity:
 
-- `position` is the current human-facing order. It can change when a step is removed.
+- `key` is an agent-chosen request-local symbol. It is never used as stored authority after plan creation.
+- `position` is the human-facing execution order within the complete plan.
 - `step_id` is an immutable opaque step identity such as `stp_B7Q2K9`. It is never renumbered or reused.
 - `ref` is an immutable opaque identity for one declared output, such as `stock_R4M8XP`. It remains stable for the plan's lifetime.
 
-Never use a display ordinal such as `step-1` as an identity. If the first step is removed, the remaining steps may be displayed as 1 and 2 again without changing either step's `step_id` or outputs.
+Never use a display ordinal such as `step-1` as an identity. Persistent step IDs and output refs remain the authoritative identities during review and commit.
 
-References are plan-local. Because every consuming call already includes `plan_id`, the reference itself does not repeat that plan ID. The server internally resolves `(plan_id, ref)` and rejects unknown, invalidated, cross-plan, wrong-type, or not-yet-available references. Every entity-ID field on a mutation tool accepts this scalar union:
+Stored references are plan-local. The server internally resolves `(plan_id, ref)` and rejects unknown, invalidated, cross-plan, wrong-type, or not-yet-available references. Existing-entity fields in action arguments accept a numeric ID or decimal ID string; fields that can consume a newly created entity additionally accept a local reference:
 
 ```ts
-type EntityId = number | string;
+type ExistingEntityId = number | `${number}`;
+type LocalOutputRef = { step: string; output: string };
+type EntityId = ExistingEntityId | LocalOutputRef;
 ```
 
-Numbers and decimal strings such as `91` and `"91"` identify existing InvenTree entities; the connector normalizes and validates them as positive safe integers. Any other string is treated as an opaque server-issued plan ref. Refs use typed, nonnumeric prefixes, so they cannot collide with an existing numeric ID. Clients copy refs exactly and never construct them. The legacy `{ "id": 91 }` and `{ "ref": "stock_R4M8XP" }` forms remain accepted by `print_labels`, but scalars are canonical.
+Numbers and decimal strings such as `91` and `"91"` identify existing InvenTree entities. Agent-generated keys and output names are explicit object fields, so they cannot collide with numeric IDs or server refs. A local reference must point backward to a unique earlier step and one of that action's actual declared outputs. Unknown, forward, and wrong-type references reject the complete request and discard any temporary partial plan state.
 
 Ref substitution applies to both request bodies and entity IDs embedded in request paths, so a planned entity can be updated by a later step before its numeric ID exists. A workflow that must search InvenTree cannot search a future entity; in that case the caller supplies a more explicit earlier output ref, such as `stock_item_id`, or selects a non-searching mode such as `merge: "new_item"`.
 
-### Staging contract
+### Complete-plan creation contract
 
-Every staging tool accepts these plan-control fields alongside its workflow fields:
+`create_inventory_plan` accepts one top-level idempotency key and an ordered list of typed actions:
 
 ```json
 {
-  "plan_id": "optional-existing-plan",
-  "expected_version": 1,
-  "operation_id": "caller-stable-idempotency-key"
+  "operation_id": "add-new-capacitor",
+  "steps": [
+    {
+      "key": "part",
+      "action": "create_part_with_stock",
+      "arguments": {
+        "part": { "name": "10 kOhm resistor", "category_id": 15 },
+        "initial_stock": { "quantity": 200, "location_id": 81 }
+      }
+    },
+    {
+      "key": "label",
+      "action": "print_labels",
+      "arguments": {
+        "entity_type": "stock_item",
+        "entities": [{ "step": "part", "output": "stock_item" }],
+        "template": "30x15mm",
+        "copies": 1
+      }
+    }
+  ]
 }
 ```
 
-- Omit `plan_id` to create a plan implicitly.
-- Supply `plan_id` and the latest `expected_version` to append serially.
-- Reusing `operation_id` for the same operation returns its existing step rather than appending a duplicate.
-- Reusing an operation ID for different content is an error.
-- A successful append increments `plan_version` and refreshes idle expiry.
-- The first staged response includes concise append/review guidance. Later responses omit that repeated paragraph because plan status, ID, and version already convey the next action.
+- Action arguments never contain `plan_id`, `expected_version`, or their own `operation_id`.
+- Step keys are unique, short request-local identifiers.
+- Steps execute in array order and may reference only earlier outputs.
+- Every action is validated using the same private compiler used for single-step plans.
+- If any action fails validation, the server discards temporary staged state and returns no usable plan.
+- Steps that prove already current may be listed in `skipped_steps`; if every step is already current, no plan is created.
+- Reusing the top-level `operation_id` with identical content returns the existing plan without changing its version.
+- Reusing it with different content is a conflict.
 
 The response is informational, not a confirmation request. MCP structured responses use one consistent `{ data: ... }` envelope:
 
@@ -583,14 +601,17 @@ The response is informational, not a confirmation request. MCP structured respon
     "status": "staged",
     "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
     "plan_version": 2,
-    "step_id": "stp_B7Q2K9",
-    "position": 2,
-    "outputs": [
+    "operation_count": 3,
+    "aliases": { "part": { "part": "part_A1B2C3", "stock_item": "stock_R4M8XP" } },
+    "steps": [
       {
-        "name": "stock_item",
-        "entity_type": "stock_item",
-        "ref": "stock_R4M8XP",
-        "display": "10 kOhm resistor in Drawer A3"
+        "position": 1,
+        "step_id": "stp_B7Q2K9",
+        "summary": "Create part ...",
+        "operation_count": 2,
+        "outputs": [
+          { "name": "stock_item", "entity_type": "stock_item", "ref": "stock_R4M8XP", "display": "10 kOhm resistor in Drawer A3" }
+        ]
       }
     ]
   }
@@ -599,40 +620,13 @@ The response is informational, not a confirmation request. MCP structured respon
 
 Every workflow summary must expose all material non-default fields that will be written, including descriptions, keywords, metadata, packaging, expiry, notes, status, print template, printer, copy count, and the number/order of upstream operations. Long values may be visibly truncated only if the complete value remains bound to the frozen plan.
 
-### Referencing an entity created earlier in the plan
+At commit, the connector extracts real InvenTree IDs from producer responses and substitutes them into later request bodies and paths. The `aliases` response mapping is informational; commit uses only canonical server-issued identities.
 
-For example, `create_part_with_stock` can return a future stock ref. A later label step uses it without knowing the eventual InvenTree ID:
+### Review and discard
 
-```json
-{
-  "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
-  "expected_version": 1,
-  "operation_id": "print-new-stock-label",
-  "entity_type": "stock_item",
-  "entities": ["stock_R4M8XP"],
-  "template": "30x15mm",
-  "printer": "zebra",
-  "copies": 1
-}
-```
+The successful `create_inventory_plan` response is the canonical consolidated preview. It includes current position, immutable step ID, every material field and side effect, declared outputs, and upstream operation order. The assistant asks the user to confirm after presenting this response. `review_inventory_plan(plan_id)` remains available to refresh or re-display the same complete plan.
 
-Plans execute in their displayed serial order, so a ref may only consume an output from an earlier step. At commit, the connector extracts the real ID from the producer response and substitutes it into later request bodies.
-
-### Review and plan editing
-
-`review_inventory_plan(plan_id)` is the canonical, consolidated preview. It includes current position, immutable step ID, every material field and side effect, declared outputs, and upstream operation order. This is the first point at which the assistant asks the user to confirm.
-
-If and only if the user asks for extended or detailed confirmation, the assistant may call `open_inventory_plan_review(plan_id)`. This non-destructive tool attaches an MCP App resource while returning the same complete Markdown fallback. The app shows each immutable step, material summary, declared output, upstream operation count, expiry, and the non-transactional execution warning. Its commit button requires an explicit acknowledgement and calls the existing `commit_inventory_plan(plan_id, expected_version)` through the host, so normal ownership, version, stale-state, idempotency, and partial-failure rules remain authoritative. The app receives structured review data but never OAuth credentials or raw internal request bodies.
-
-MCP Apps support is optional and host-dependent. The ordinary `review_inventory_plan` and commit flow remains canonical for routine confirmation and for clients that do not render the `ui://inventree/inventory-plan-review.html` resource.
-
-Plan management is non-destructive:
-
-- `remove_inventory_plan_step(plan_id, step_id, expected_version, cascade=false)` removes an independent step.
-- If another step consumes the target's outputs, removal is rejected and lists immutable dependent step IDs.
-- `cascade: true` explicitly removes the producer and all transitive dependents.
-- `discard_inventory_plan(plan_id)` deletes only temporary connector state.
-- Removed step and ref IDs are never reused.
+There is no incremental plan-editing surface. If the workflow is wrong, `discard_inventory_plan(plan_id)` deletes only temporary connector state and the assistant creates a new complete plan.
 
 ### Commit and retry behavior
 
@@ -667,7 +661,9 @@ The following constraints came from exercising the tools against a real home inv
 - Unfiltered category/location browsing starts at top-level nodes. Full trees require `full_tree: true` or branch expansion with `root_id`.
 - Paged part search uses an absolute range such as `Results 6-10 of 17`.
 
-### Agent exploration findings: 2026-07-25
+### Historical agent exploration findings: 2026-07-25
+
+This section records testing of the former incremental staging surface. Its domain findings still apply, but individual mutation tools and append calls described below were replaced by one-shot `create_inventory_plan` action arrays.
 
 After restarting Codex and the development server, the connector was exercised through its published MCP tools as an agent rather than through unit-test fixtures. The exploration covered:
 
@@ -677,7 +673,6 @@ After restarting Codex and the development server, the connector was exercised t
 - `create_part_with_stock` followed by `print_labels` using the planned stock-item ref;
 - consolidated plan review;
 - duplicate `operation_id` replay and stale-version rejection;
-- dependent-step rejection, successful removal, and re-append with a new immutable step ID;
 - an already-current stock count;
 - existing-stock label and partial-move previews.
 
@@ -695,7 +690,6 @@ No plan was committed. All temporary probe plans were discarded, and a final exa
 - A create step returns typed part and stock refs; a later label step accepts the future stock ref.
 - Replaying identical content with the same `operation_id` returns the existing step without incrementing the plan version.
 - A unique append with a stale `expected_version` fails with both expected and current versions.
-- Removing a producer lists the immutable dependent step IDs; removing and re-adding a dependent creates a new step ID while preserving the producer's output ref.
 - An unchanged count returns `already_current` without creating a plan.
 - Partial movement explicitly warns that InvenTree will split the source stock item.
 
@@ -751,34 +745,32 @@ One MCP call should normally answer this question.
 ### "Add these 200 capacitors to my inventory"
 
 1. `find_parts` to check for duplicates.
-2. If the part exists, use `browse_stock_locations` only if the destination is unresolved, then stage `receive_stock` in a new plan.
-3. If it does not exist, use `browse_part_categories` and `browse_stock_locations`, then stage `create_part_with_stock` in a new plan.
-4. If a label is wanted, append `print_labels` to the same plan using the server-issued reference to the planned stock item.
-5. Call `review_inventory_plan` and show the complete consolidated preview.
-6. Ask for confirmation once.
-7. Call `commit_inventory_plan` after confirmation.
+2. Resolve the destination with `browse_stock_locations` only if needed; if creating a part, resolve its category too.
+3. Call `create_inventory_plan` once. Use a `receive_stock` action for an existing part, or `create_part_with_stock` for a new one.
+4. If a label is wanted, include a later `print_labels` action whose entity is `{ "step": "part", "output": "stock_item" }`.
+5. Present the complete review returned by `create_inventory_plan` and ask for confirmation once.
+6. Call `commit_inventory_plan` after confirmation.
 
 ### "I used five from the workbench"
 
 1. `find_parts` if the part is not already in context.
-2. Stage `consume_stock` with the resolved workbench location.
+2. Create a plan containing `consume_stock` with the resolved workbench location.
 3. If multiple eligible stock items remain, show candidates or the explicit allocation plan.
-4. Review the plan, ask once for confirmation, and commit it.
+4. Present the returned complete plan, ask once for confirmation, and commit it.
 
 ### "What is actually in drawer A3?"
 
 1. Resolve A3 with `browse_stock_locations(search="A3")` if needed.
 2. `inventory_at_location(location_id=81)`.
-3. If the user is physically counting, prepare one batched `count_stock` from their observations rather than issuing individual adjustments.
+3. If the user is physically counting, create one plan with a batched `count_stock` action rather than individual adjustments.
 
 ### "Reorganize this cabinet"
 
 1. Read the location subtree and its inventory.
-2. Stage location creates/renames in one plan.
-3. Append stock moves using server-issued references for planned destination locations.
-4. Append label printing for the final planned locations.
-5. Review the complete serial plan and ask once for confirmation.
-6. Commit the plan, while preserving a clear report boundary between structure changes, stock movement, and printing.
+2. Submit one `create_inventory_plan` call containing location creates/renames, then stock moves and label actions in serial order.
+3. Use request-local `{ "step", "output" }` references for planned destination locations.
+4. Present the complete serial plan returned by that call and ask once for confirmation.
+5. Commit the plan, while preserving a clear report boundary between structure changes, stock movement, and printing.
 
 ## Recommended tool set and priority
 
@@ -795,27 +787,21 @@ This phase is read-only and immediately reduces context use and call count. It s
 
 ### Phase 2: cover daily stock mutations
 
-1. `create_part_with_stock`
-2. `update_part`
-3. `receive_stock`
-4. `consume_stock`
-5. `move_stock`
-6. `count_stock`
-7. `review_inventory_plan`
-8. `remove_inventory_plan_step`
-9. `discard_inventory_plan`
-10. `commit_inventory_plan`
+1. `create_inventory_plan` with typed part, receive, consume, move, count, and image actions
+2. `review_inventory_plan`
+3. `discard_inventory_plan`
+4. `commit_inventory_plan`
 
 After these are proven, disable `inventree_write` by default. Keep it behind an explicit deployment flag for development.
 
 ### Phase 3: physical organization and maintenance
 
-1. category create/update
-2. location create/update
+1. category create/update action variants
+2. location create/update action variants
 3. `get_stock_history`
-4. `set_stock_status`
+4. `set_stock_status` action
 5. `scan_barcode`
-6. `print_labels`
+6. `print_labels` action
 
 ### Remove or demote
 
@@ -878,5 +864,6 @@ The optimized connector is successful when:
 - The model never needs to know an InvenTree API path for a normal home-inventory task.
 - Add, remove, count, and move cannot be confused by quantity semantics.
 - Every mutation preview identifies exact records and before/after quantities or paths.
+- Any complete mutation workflow, including dependent creates and printing, is staged and reviewed with one `create_inventory_plan` call.
 - User confirmation is requested once and bound to the reviewed version of a short-lived shared plan.
 - Full raw API access is exceptional, visibly advanced, and read-only by default.

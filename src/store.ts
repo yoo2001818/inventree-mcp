@@ -100,6 +100,10 @@ export interface MutationCommitResult {
 export interface MutationPlan {
   id: string;
   credentialsId: string;
+  creationOperationId?: string;
+  creationDigest?: string;
+  creationAliases?: Record<string, Record<string, string>>;
+  creationSkippedSteps?: Array<{ key: string; action: string; status: string }>;
   version: number;
   state: "staging" | "committing" | "committed" | "failed";
   steps: MutationStep[];

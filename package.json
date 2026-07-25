@@ -1,6 +1,6 @@
 {
   "name": "inventree-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "An OAuth-protected MCP bridge for InvenTree",
@@ -8,19 +8,14 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "npm run build:app && tsc -p tsconfig.build.json",
-    "build:app": "vite build",
-    "predev": "npm run build:app",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "tsx --env-file=.env src/index.ts",
-    "predev:watch": "npm run build:app",
     "dev:watch": "tsx watch --env-file=.env src/index.ts",
-    "pretest": "npm run build:app",
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/**/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.app.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "^1.7.5",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
     "express": "^5.1.0",
@@ -36,8 +31,6 @@
     "@types/supertest": "^7.2.1",
     "supertest": "^7.1.4",
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2",
-    "vite": "^8.1.5",
-    "vite-plugin-singlefile": "^2.3.3"
+    "typescript": "^5.9.2"
   }
 }

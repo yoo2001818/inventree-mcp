@@ -1,0 +1,290 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { DomainError } from "../domainErrors.js";
+import {
+  commitPlan,
+  digest,
+  discardPlan,
+  reviewPlan,
+} from "../mutationPlans.js";
+import type { OAuthService } from "../oauth.js";
+import type { PartImageUploads } from "../partImages.js";
+import { clientFor, result, safely, WRITE_SECURITY } from "../mcpSupport.js";
+import {
+  MutationPrimitiveRegistry,
+  authenticatedCredentialsId,
+  commitAnnotations,
+  mutationAnnotations,
+  type PrimitiveDefinition,
+} from "./shared.js";
+
+function primitiveArgumentsShape(definition: PrimitiveDefinition): z.ZodRawShape {
+  const { plan_id: _planId, expected_version: _expectedVersion, operation_id: _operationId, ...shape } = definition.config.inputSchema;
+  return shape;
+}
+
+function resolveLocalPlanRefs(
+  value: unknown,
+  aliases: Map<string, Map<string, string>>,
+): unknown {
+  if (Array.isArray(value)) return value.map((item) => resolveLocalPlanRefs(item, aliases));
+  if (value === null || typeof value !== "object") return value;
+  const object = value as Record<string, unknown>;
+  const keys = Object.keys(object);
+  if (keys.length === 2 && keys.includes("step") && keys.includes("output")) {
+    const step = String(object.step);
+    const output = String(object.output);
+    const ref = aliases.get(step)?.get(output);
+    if (!ref) {
+      throw new DomainError(
+        { status: "invalid_plan_reference", step, output },
+        `Unknown or forward local plan reference ${step}.${output}; references must name an output from an earlier step`,
+      );
+    }
+    return ref;
+  }
+  return Object.fromEntries(Object.entries(object).map(([key, child]) => [key, resolveLocalPlanRefs(child, aliases)]));
+}
+
+function canonicalPlanData(reviewed: ReturnType<typeof reviewPlan>) {
+  return {
+    status: reviewed.plan.state === "staging" ? "staged" : reviewed.plan.state,
+    plan_id: reviewed.plan.id,
+    plan_version: reviewed.plan.version,
+    expires_at: new Date(reviewed.plan.expiresAt).toISOString(),
+    operation_count: reviewed.plan.steps.reduce((total, step) => total + step.requests.length, 0),
+    steps: reviewed.plan.steps.map((step, index) => ({
+      position: index + 1,
+      step_id: step.id,
+      operation_id: step.operationId,
+      summary: step.summary,
+      operation_count: step.requests.length,
+      outputs: step.outputs.map(({ ref, name, entityType, display }) => ({
+        ref,
+        name,
+        entity_type: entityType,
+        display,
+      })),
+    })),
+  };
+}
+
+function registerCreateInventoryPlan(
+  server: McpServer,
+  oauth: OAuthService,
+  primitives: MutationPrimitiveRegistry,
+): void {
+  const variants = primitives.definitions.map((definition) => z.object({
+    key: z.string().min(1).max(64).regex(/^[A-Za-z][A-Za-z0-9_-]*$/)
+      .describe("Request-local step key used by later {step, output} references"),
+    action: z.literal(definition.name),
+    arguments: z.object(primitiveArgumentsShape(definition)).strict(),
+  }).strict().describe(definition.config.description));
+  if (variants.length < 2) throw new Error("create_inventory_plan requires at least two mutation primitives");
+  const stepSchema = z.union(variants as unknown as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+  const stepsSchema = z.array(stepSchema).min(1).max(30).superRefine((steps, context) => {
+    const seen = new Set<string>();
+    for (const [index, step] of steps.entries()) {
+      const key = String((step as { key: string }).key);
+      if (seen.has(key)) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: `Duplicate step key: ${key}`, path: [index, "key"] });
+      }
+      seen.add(key);
+    }
+  });
+
+  server.registerTool(
+    "create_inventory_plan",
+    {
+      title: "Create a complete inventory mutation plan",
+      description:
+        "Validate and stage an entire ordered inventory workflow in one call. Use request-local step keys and {step, output} references for dependencies. The response is the complete canonical review; ask once for confirmation, then call commit_inventory_plan.",
+      inputSchema: {
+        operation_id: z.string().min(1).max(100).describe("Caller-stable idempotency key for the complete plan"),
+        steps: stepsSchema,
+      },
+      annotations: mutationAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async (input, extra) => safely(oauth, async () => {
+      const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+      oauth.store.cleanup();
+      const owner = authenticatedCredentialsId(auth);
+      const creationDigest = digest(input.steps);
+      const existing = Object.values(oauth.store.snapshot.mutationPlans).find(
+        (plan) => plan.credentialsId === owner && plan.creationOperationId === input.operation_id,
+      );
+      if (existing) {
+        if (existing.creationDigest !== creationDigest) {
+          throw new DomainError(
+            { status: "conflict", conflict_type: "operation_id", operation_id: input.operation_id },
+            `operation_id ${input.operation_id} was already used for a different inventory plan`,
+          );
+        }
+        const reviewed = reviewPlan(oauth, auth, existing.id);
+        return result(
+          {
+            ...canonicalPlanData(reviewed),
+            operation_id: input.operation_id,
+            duplicate_operation: true,
+            aliases: existing.creationAliases ?? {},
+            ...(existing.creationSkippedSteps?.length ? { skipped_steps: existing.creationSkippedSteps } : {}),
+          },
+          `${reviewed.text}\n\nThis complete plan was already created for the same operation_id.`,
+        );
+      }
+      const aliases = new Map<string, Map<string, string>>();
+      const publicAliases: Record<string, Record<string, string>> = {};
+      const skipped: Array<{ key: string; action: string; status: string }> = [];
+      let planId: string | undefined;
+      let planVersion: number | undefined;
+      try {
+        for (const rawStep of input.steps as Array<{ key: string; action: string; arguments: Record<string, unknown> }>) {
+          const definition = primitives.definitions.find((candidate) => candidate.name === rawStep.action)!;
+          const resolvedArguments = resolveLocalPlanRefs(rawStep.arguments, aliases) as Record<string, unknown>;
+          const outcome = await definition.handler({
+            ...resolvedArguments,
+            operation_id: `${input.operation_id}:${rawStep.key}`,
+            ...(planId ? { plan_id: planId, expected_version: planVersion } : {}),
+          }, extra);
+          if (outcome?.isError) {
+            if (planId) discardPlan(oauth, auth, planId);
+            return outcome;
+          }
+          const data = outcome?.structuredContent?.data as Record<string, unknown> | undefined;
+          if (data?.status !== "staged") {
+            skipped.push({ key: rawStep.key, action: rawStep.action, status: String(data?.status ?? "no_change") });
+            continue;
+          }
+          planId = String(data.plan_id);
+          planVersion = Number(data.plan_version);
+          const outputs = Array.isArray(data.outputs) ? data.outputs as Array<Record<string, unknown>> : [];
+          const stepAliases = new Map<string, string>();
+          publicAliases[rawStep.key] = {};
+          for (const output of outputs) {
+            const name = String(output.name);
+            const ref = String(output.ref);
+            stepAliases.set(name, ref);
+            publicAliases[rawStep.key]![name] = ref;
+          }
+          aliases.set(rawStep.key, stepAliases);
+        }
+      } catch (error) {
+        if (planId) discardPlan(oauth, auth, planId);
+        throw error;
+      }
+      if (!planId) {
+        return result(
+          { status: "already_current", operation_id: input.operation_id, skipped_steps: skipped },
+          "No inventory changes are required; no plan was created.",
+        );
+      }
+      oauth.store.mutate((data) => {
+        Object.assign(data.mutationPlans[planId]!, {
+          creationOperationId: input.operation_id,
+          creationDigest,
+          creationAliases: publicAliases,
+          creationSkippedSteps: skipped,
+        });
+      });
+      const reviewed = reviewPlan(oauth, auth, planId);
+      return result(
+        {
+          ...canonicalPlanData(reviewed),
+          operation_id: input.operation_id,
+          aliases: publicAliases,
+          ...(skipped.length ? { skipped_steps: skipped } : {}),
+        },
+        `${reviewed.text}\n\nThis is the complete canonical review. Ask the user for one final confirmation before commit_inventory_plan.`,
+      );
+    }),
+  );
+}
+
+
+export function registerInventoryPlanTools(
+  server: McpServer,
+  oauth: OAuthService,
+  imageUploads: PartImageUploads,
+  primitives: MutationPrimitiveRegistry,
+): void {
+  registerCreateInventoryPlan(server, oauth, primitives);
+  server.registerTool(
+    "review_inventory_plan",
+    {
+      title: "Review an inventory plan",
+      description: "Show every staged step, immutable step ID, and future entity reference in one shared inventory plan.",
+      inputSchema: { plan_id: z.string().min(16) },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async ({ plan_id }, extra) =>
+      safely(oauth, async () => {
+        const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const reviewed = reviewPlan(oauth, auth, plan_id);
+        return result(
+          {
+            status: reviewed.plan.state,
+            plan_id,
+            plan_version: reviewed.plan.version,
+            steps: reviewed.plan.steps.map((step, index) => ({
+              position: index + 1,
+              step_id: step.id,
+              operation_id: step.operationId,
+              summary: step.summary,
+              operation_count: step.requests.length,
+              outputs: step.outputs.map(({ ref, name, entityType, display }) => ({ ref, name, entity_type: entityType, display })),
+            })),
+          },
+          reviewed.text,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "discard_inventory_plan",
+    {
+      title: "Discard an inventory plan",
+      description: "Discard a staged plan without changing InvenTree.",
+      inputSchema: { plan_id: z.string().min(16) },
+      annotations: mutationAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async ({ plan_id }, extra) => safely(oauth, async () => {
+      const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+      discardPlan(oauth, auth, plan_id);
+      return result({ status: "discarded", plan_id }, `Discarded inventory plan ${plan_id}. No InvenTree changes were made.`);
+    }),
+  );
+
+  server.registerTool(
+    "commit_inventory_plan",
+    {
+      title: "Commit a reviewed inventory plan",
+      description: "After the user's single final confirmation, revalidate and execute all staged steps serially. Safe retries return the recorded result.",
+      inputSchema: { plan_id: z.string().min(16), expected_version: z.number().int().positive() },
+      annotations: commitAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async ({ plan_id, expected_version }, extra) => safely(oauth, async () => {
+      const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+      const committed = await commitPlan(oauth, auth, client, plan_id, expected_version, imageUploads);
+      const resolved = Object.entries(committed.result.resolvedRefs).map(([ref, id]) => `${ref}=#${id}`);
+      return result(
+        {
+          status: committed.result.status,
+          plan_id,
+          plan_version: committed.plan.version,
+          completed_steps: committed.result.completedSteps,
+          completed_requests: committed.result.completedRequests,
+          resolved_refs: committed.result.resolvedRefs,
+          result_ids: committed.result.resultIds,
+          ...(committed.result.failedStepId ? { failed_step_id: committed.result.failedStepId } : {}),
+          ...(committed.result.error ? { error: committed.result.error } : {}),
+        },
+        `Committed ${committed.result.completedSteps} steps (${committed.result.completedRequests} upstream operations) successfully.${resolved.length ? ` Resolved references: ${resolved.join(", ")}.` : ""}`,
+      );
+    }),
+  );
+
+}
