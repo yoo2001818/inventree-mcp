@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { DomainError, notFound } from "./domainErrors.js";
 import {
   displayPath,
   entityRef,
@@ -13,7 +14,7 @@ import {
   type EntityRef,
   type JsonRecord,
 } from "./inventoryDomain.js";
-import type { InvenTreeClient } from "./inventree.js";
+import { InvenTreeClient, InvenTreeError } from "./inventree.js";
 import {
   captureCheck,
   commitPlan,
@@ -25,24 +26,25 @@ import {
   type PlannedOutputInput,
 } from "./mutationPlans.js";
 import type { OAuthService } from "./oauth.js";
+import type { PartImageUploads } from "./partImages.js";
 import { clientFor, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import type { MutationCheck, MutationRequest } from "./store.js";
 import type { InventoryEntityType, MutationOutput } from "./store.js";
 
 const positiveQuantity = z.number().positive().finite();
-const optionalText = z.string().max(50_000).nullable().optional();
-const entityIdSchema = z.union([
+const optionalText = () => z.string().max(50_000).nullable().optional();
+const entityIdSchema = () => z.union([
   z.number().int().positive(),
   z.string().min(1).describe("Existing numeric ID or a server-issued ref from an earlier plan step"),
 ]);
-const nullableEntityIdSchema = entityIdSchema.nullable();
+const nullableEntityIdSchema = () => entityIdSchema().nullable();
 const planInputFields = {
   plan_id: z.string().min(16).optional().describe("Existing shared plan to append to; omit to start a new plan"),
   expected_version: z.number().int().positive().optional().describe("Required with plan_id to prevent lost updates"),
   operation_id: z.string().min(1).max(100).describe("Caller-stable idempotency key for this staged step"),
 };
 const entitySelectorSchema = z.union([
-  entityIdSchema,
+  entityIdSchema(),
   z.object({ id: z.number().int().positive() }).strict(),
   z.object({ ref: z.string().min(1) }).strict(),
 ]);
@@ -62,19 +64,47 @@ const STATUS_CODES = {
 } as const;
 
 async function getPart(client: InvenTreeClient, id: number): Promise<JsonRecord> {
-  return record(await client.get(`/api/part/${id}/`, { category_detail: true, location_detail: true }));
+  try {
+    return record(await client.get(`/api/part/${id}/`, { category_detail: true, location_detail: true }));
+  } catch (error) {
+    if (error instanceof InvenTreeError && error.status === 404) {
+      throw notFound("part", { supplied_id: id }, "find_parts", `Part #${id} was not found. Use find_parts to resolve the current ID.`);
+    }
+    throw error;
+  }
 }
 
 async function getStock(client: InvenTreeClient, id: number): Promise<JsonRecord> {
-  return record(await client.get(`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }));
+  try {
+    return record(await client.get(`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }));
+  } catch (error) {
+    if (error instanceof InvenTreeError && error.status === 404) {
+      throw notFound("stock_item", { supplied_id: id }, "get_part_inventory", `Stock item #${id} was not found. Use get_part_inventory to resolve current stock-item IDs.`);
+    }
+    throw error;
+  }
 }
 
 async function getCategory(client: InvenTreeClient, id: number): Promise<JsonRecord> {
-  return record(await client.get(`/api/part/category/${id}/`, { path_detail: true }));
+  try {
+    return record(await client.get(`/api/part/category/${id}/`, { path_detail: true }));
+  } catch (error) {
+    if (error instanceof InvenTreeError && error.status === 404) {
+      throw notFound("part_category", { supplied_id: id }, "browse_part_categories", `Part category #${id} was not found. Use browse_part_categories to resolve the current ID.`);
+    }
+    throw error;
+  }
 }
 
 async function getLocation(client: InvenTreeClient, id: number): Promise<JsonRecord> {
-  return record(await client.get(`/api/stock/location/${id}/`, { path_detail: true }));
+  try {
+    return record(await client.get(`/api/stock/location/${id}/`, { path_detail: true }));
+  } catch (error) {
+    if (error instanceof InvenTreeError && error.status === 404) {
+      throw notFound("stock_location", { supplied_id: id }, "browse_stock_locations", `Stock location #${id} was not found. Use browse_stock_locations to resolve the current ID.`);
+    }
+    throw error;
+  }
 }
 
 function refOrFallback(value: unknown, kind: string, id: number): EntityRef {
@@ -219,7 +249,13 @@ function pathSegments(path: string): string[] {
     .filter(Boolean);
 }
 
-export function registerWriteTools(server: McpServer, oauth: OAuthService): void {
+function authenticatedCredentialsId(auth: Parameters<typeof reviewPlan>[1]): string {
+  const id = String(auth.extra?.credentialsId ?? "");
+  if (!id) throw new Error("Authenticated InvenTree credentials are missing");
+  return id;
+}
+
+export function registerWriteTools(server: McpServer, oauth: OAuthService, imageUploads: PartImageUploads): void {
   server.registerTool(
     "create_part_with_stock",
     {
@@ -231,25 +267,25 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         part: z.object({
           name: z.string().min(1).max(100),
           description: z.string().max(250).default(""),
-          category_id: entityIdSchema,
+          category_id: entityIdSchema(),
           IPN: z.string().max(100).default(""),
           keywords: z.array(z.string().min(1)).default([]),
           units: z.string().max(20).nullable().optional(),
           minimum_stock: z.number().nonnegative().default(0),
           maximum_stock: z.number().nonnegative().default(0),
-          default_location_id: nullableEntityIdSchema.optional(),
+          default_location_id: nullableEntityIdSchema().optional(),
           trackable: z.boolean().default(false),
           link: z.string().url().max(2000).nullable().optional(),
-          notes: optionalText,
+          notes: optionalText(),
         }),
         initial_stock: z
           .object({
             quantity: positiveQuantity,
-            location_id: entityIdSchema,
+            location_id: entityIdSchema(),
             batch: z.string().max(100).nullable().optional(),
             packaging: z.string().max(50).nullable().optional(),
             expiry_date: z.string().date().nullable().optional(),
-            notes: optionalText,
+            notes: optionalText(),
           })
           .nullable()
           .default(null),
@@ -289,7 +325,12 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         const duplicates = await client.get("/api/part/", duplicateQuery);
         const candidates = pageResults(duplicates);
         if (candidates.length && !input.allow_possible_duplicates) {
-          throw new Error(
+          const duplicateCandidates = candidates.map((candidate) => ({
+            id: numberValue(candidate.pk),
+            name: stringValue(candidate.name),
+          }));
+          throw new DomainError(
+            { status: "conflict", conflict_type: "possible_duplicates", candidates: duplicateCandidates },
             `Possible duplicate parts found: ${candidates
               .map((candidate) => `${stringValue(candidate.name)} (#${numberValue(candidate.pk)})`)
               .join(", ")}. Reuse one, or set allow_possible_duplicates after reviewing them.`,
@@ -408,20 +449,20 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare a sparse metadata update for an existing part and show an exact before/after diff.",
       inputSchema: {
         ...planInputFields,
-        part_id: entityIdSchema,
+        part_id: entityIdSchema(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
           description: z.string().max(250).optional(),
-          category_id: nullableEntityIdSchema.optional(),
+          category_id: nullableEntityIdSchema().optional(),
           IPN: z.string().max(100).optional(),
           keywords: z.array(z.string().min(1)).optional(),
           units: z.string().max(20).nullable().optional(),
           minimum_stock: z.number().nonnegative().optional(),
           maximum_stock: z.number().nonnegative().optional(),
-          default_location_id: nullableEntityIdSchema.optional(),
+          default_location_id: nullableEntityIdSchema().optional(),
           default_expiry: z.number().int().nonnegative().optional(),
           link: z.string().url().max(2000).nullable().optional(),
-          notes: optionalText,
+          notes: optionalText(),
           tags: z.array(z.string()).optional(),
           active: z.boolean().optional(),
           trackable: z.boolean().optional(),
@@ -531,6 +572,126 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
   );
 
   server.registerTool(
+    "prepare_part_image_upload",
+    {
+      title: "Prepare a part-image upload",
+      description: "Create an expiring capability URL for uploading image bytes outside MCP JSON. The URL works in a browser or with a raw HTTP PUT.",
+      inputSchema: {
+        filename: z.string().min(1).max(120).optional().describe("Optional filename hint used when the image is staged"),
+      },
+      annotations: mutationAnnotations(false),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async (input, extra) =>
+      safely(oauth, async () => {
+        const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const upload = imageUploads.prepare(authenticatedCredentialsId(auth), input.filename);
+        const uploadUrl = new URL("/part-images/upload", oauth.config.publicUrl);
+        uploadUrl.searchParams.set("token", upload.token);
+        const expiresAt = new Date(upload.expiresAt).toISOString();
+        return result(
+          {
+            status: "awaiting_upload",
+            upload_ref: upload.uploadRef,
+            upload_url: uploadUrl.toString(),
+            method: "PUT",
+            accepted_mime_types: ["image/png", "image/jpeg", "image/gif", "image/webp"],
+            max_bytes: imageUploads.maxBytes,
+            max_pixels: imageUploads.maxPixels,
+            expires_at: expiresAt,
+          },
+          [
+            `Upload reference: ${upload.uploadRef}`,
+            `[Open the secure upload page](${uploadUrl.toString()})`,
+            "A native client may instead PUT the raw image bytes to the same URL with the image Content-Type and optional X-File-Name header.",
+            `The URL expires at ${expiresAt}. After uploading, call get_part_image_upload_status or stage set_part_image with the upload reference.`,
+          ].join("\n\n"),
+        );
+      }),
+  );
+
+  server.registerTool(
+    "get_part_image_upload_status",
+    {
+      title: "Check a part-image upload",
+      description: "Check whether an expiring part-image upload reference is pending or ready to use with set_part_image.",
+      inputSchema: {
+        upload_ref: z.string().startsWith("upload_"),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async (input, extra) =>
+      safely(oauth, async () => {
+        const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const upload = imageUploads.status(input.upload_ref, authenticatedCredentialsId(auth));
+        const expiresAt = new Date(upload.expiresAt).toISOString();
+        const data = upload.image
+          ? {
+              status: "ready" as const,
+              upload_ref: input.upload_ref,
+              filename: upload.image.filename,
+              mime_type: upload.image.mimeType,
+              byte_size: upload.image.byteSize,
+              width: upload.image.width,
+              height: upload.image.height,
+              expires_at: expiresAt,
+            }
+          : { status: "pending" as const, upload_ref: input.upload_ref, expires_at: expiresAt };
+        return result(
+          data,
+          upload.image
+            ? `${input.upload_ref} is ready: ${upload.image.filename}, ${upload.image.width}x${upload.image.height}, ${upload.image.byteSize} bytes.`
+            : `${input.upload_ref} is still waiting for an image upload.`,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "set_part_image",
+    {
+      title: "Prepare replacement of a part image",
+      description: "Stage a part-image replacement using an opaque temporary upload_ref obtained from prepare_part_image_upload.",
+      inputSchema: {
+        ...planInputFields,
+        part_id: entityIdSchema(),
+        upload_ref: z.string().startsWith("upload_"),
+      },
+      annotations: mutationAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async (input, extra) =>
+      safely(oauth, async () => {
+        const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const partId = normalizeEntityId(input.part_id);
+        const partOutput = plannedOutput(oauth, auth, input.plan_id, partId, "part");
+        const part = typeof partId === "number" ? await getPart(client, partId) : undefined;
+        if (part) ensureUnlocked(part);
+        const upload = imageUploads.get(input.upload_ref, authenticatedCredentialsId(auth));
+        const identity = plannedLabel(partOutput, part ? formatRef(partRef(part)) : `Part ${String(partId)}`);
+        const currentImage = part ? optionalString(part.image) ?? optionalString(part.thumbnail) : undefined;
+        const summary = [
+          `Replace image for ${identity}:`,
+          `- Current image: ${currentImage ? "present" : "none"}`,
+          `- Upload: ${upload.filename}`,
+          `- Type: ${upload.mimeType}`,
+          `- Dimensions: ${upload.width}x${upload.height}`,
+          `- Size: ${upload.byteSize} bytes`,
+          "- Side effect: replace the part image and let InvenTree regenerate its thumbnail.",
+        ].join("\n");
+        const checks = typeof partId === "number"
+          ? await checksFor(client, [[`/api/part/${partId}/`, { category_detail: true, location_detail: true }]])
+          : [];
+        return stageMutation(oauth, auth, input, summary, [{
+          method: "PATCH",
+          path: mutationPath("/api/part/", partId),
+          body: {},
+          imageUpload: { uploadRef: upload.ref, field: "image" },
+        }], checks);
+      }),
+  );
+
+  server.registerTool(
     "receive_stock",
     {
       title: "Prepare receipt of stock",
@@ -538,15 +699,15 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare adding newly acquired quantity to a compatible stock item or creating a new stock item. IDs are validated and the selected behavior is previewed.",
       inputSchema: {
         ...planInputFields,
-        part_id: entityIdSchema,
+        part_id: entityIdSchema(),
         quantity: positiveQuantity,
-        location_id: entityIdSchema,
+        location_id: entityIdSchema(),
         merge: z.enum(["compatible", "new_item", "stock_item"]).default("compatible"),
-        stock_item_id: entityIdSchema.optional(),
+        stock_item_id: entityIdSchema().optional(),
         batch: z.string().max(100).nullable().optional(),
         packaging: z.string().max(50).nullable().optional(),
         expiry_date: z.string().date().nullable().optional(),
-        notes: optionalText,
+        notes: optionalText(),
       },
       annotations: mutationAnnotations(),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -684,13 +845,13 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare removal of a used or discarded quantity from eligible stock. Returns an explicit per-stock-item allocation and never consumes unavailable stock.",
       inputSchema: {
         ...planInputFields,
-        part_id: entityIdSchema,
+        part_id: entityIdSchema(),
         quantity: positiveQuantity,
-        location_id: entityIdSchema.optional(),
-        stock_item_id: entityIdSchema.optional(),
+        location_id: entityIdSchema().optional(),
+        stock_item_id: entityIdSchema().optional(),
         strategy: z.enum(["fewest_items", "oldest_first"]).optional(),
         reason: z.enum(["used", "discarded", "lost", "other"]).default("used"),
-        notes: optionalText,
+        notes: optionalText(),
       },
       annotations: mutationAnnotations(),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -820,14 +981,14 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare moving one stock item, a quantity of one part from a source location, or every stock item under a source location. Total quantity is preserved.",
       inputSchema: {
         ...planInputFields,
-        destination_location_id: entityIdSchema,
-        stock_item_id: entityIdSchema.optional(),
-        part_id: entityIdSchema.optional(),
-        source_location_id: entityIdSchema.optional(),
+        destination_location_id: entityIdSchema(),
+        stock_item_id: entityIdSchema().optional(),
+        part_id: entityIdSchema().optional(),
+        source_location_id: entityIdSchema().optional(),
         quantity: positiveQuantity.optional(),
         all: z.boolean().default(false),
         include_sublocations: z.boolean().default(false),
-        notes: optionalText,
+        notes: optionalText(),
       },
       annotations: mutationAnnotations(),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -921,9 +1082,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare reconciliation of recorded stock quantities with observed physical counts.",
       inputSchema: {
         ...planInputFields,
-        counts: z.array(z.object({ stock_item_id: entityIdSchema, observed_quantity: z.number().nonnegative().finite() })).min(1).max(100),
-        location_id: entityIdSchema.optional(),
-        notes: optionalText,
+        counts: z.array(z.object({ stock_item_id: entityIdSchema(), observed_quantity: z.number().nonnegative().finite() })).min(1).max(100),
+        location_id: entityIdSchema().optional(),
+        notes: optionalText(),
       },
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -987,9 +1148,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare marking stock items OK, damaged, lost, quarantined, or another supported semantic status.",
       inputSchema: {
         ...planInputFields,
-        stock_item_ids: z.array(entityIdSchema).min(1).max(100),
+        stock_item_ids: z.array(entityIdSchema()).min(1).max(100),
         status: z.enum(["ok", "attention_needed", "damaged", "destroyed", "rejected", "lost", "quarantined", "returned"]),
-        notes: optionalText,
+        notes: optionalText(),
       },
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -1110,7 +1271,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     },
     async ({ plan_id, expected_version }, extra) => safely(oauth, async () => {
       const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-      const committed = await commitPlan(oauth, auth, client, plan_id, expected_version);
+      const committed = await commitPlan(oauth, auth, client, plan_id, expected_version, imageUploads);
       const resolved = Object.entries(committed.result.resolvedRefs).map(([ref, id]) => `${ref}=#${id}`);
       return result(
         {
@@ -1134,10 +1295,10 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
   const categoryFields = {
     ...planInputFields,
     name: z.string().min(1).max(100),
-    parent_id: nullableEntityIdSchema.optional(),
+    parent_id: nullableEntityIdSchema().optional(),
     description: z.string().max(250).default(""),
     structural: z.boolean().default(false),
-    default_location_id: nullableEntityIdSchema.optional(),
+    default_location_id: nullableEntityIdSchema().optional(),
     default_keywords: z.string().max(250).nullable().optional(),
   };
   server.registerTool(
@@ -1200,13 +1361,13 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       description: "Prepare renaming, reparenting, or changing defaults for a part category, with descendant impact shown.",
       inputSchema: {
         ...planInputFields,
-        category_id: entityIdSchema,
+        category_id: entityIdSchema(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
-          parent_id: nullableEntityIdSchema.optional(),
+          parent_id: nullableEntityIdSchema().optional(),
           description: z.string().max(250).optional(),
           structural: z.boolean().optional(),
-          default_location_id: nullableEntityIdSchema.optional(),
+          default_location_id: nullableEntityIdSchema().optional(),
           default_keywords: z.string().max(250).nullable().optional(),
         }),
       },
@@ -1317,7 +1478,7 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
   const locationFields = {
     ...planInputFields,
     name: z.string().min(1).max(100),
-    parent_id: nullableEntityIdSchema.optional(),
+    parent_id: nullableEntityIdSchema().optional(),
     description: z.string().max(250).default(""),
     structural: z.boolean().default(false),
     tags: z.array(z.string()).default([]),
@@ -1368,10 +1529,10 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       description: "Prepare renaming, reparenting, or changing a physical stock location, with descendant and item impact shown.",
       inputSchema: {
         ...planInputFields,
-        location_id: entityIdSchema,
+        location_id: entityIdSchema(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
-          parent_id: nullableEntityIdSchema.optional(),
+          parent_id: nullableEntityIdSchema().optional(),
           description: z.string().max(250).optional(),
           structural: z.boolean().optional(),
           tags: z.array(z.string()).optional(),

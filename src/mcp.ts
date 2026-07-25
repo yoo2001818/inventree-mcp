@@ -1,11 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { OAuthService } from "./oauth.js";
+import type { PartImageUploads } from "./partImages.js";
 import { clientFor, READ_SECURITY, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import { registerReadTools } from "./readTools.js";
 import { registerWriteTools } from "./writeTools.js";
 
-export function createMcpServer(oauth: OAuthService): McpServer {
+export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUploads): McpServer {
   const server = new McpServer(
     { name: "inventree-mcp", version: "0.2.0" },
     {
@@ -14,8 +15,8 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     },
   );
 
-  registerReadTools(server, oauth);
-  registerWriteTools(server, oauth);
+  registerReadTools(server, oauth, imageUploads);
+  registerWriteTools(server, oauth, imageUploads);
 
   server.registerTool(
     "inventree_get",

@@ -40,6 +40,7 @@ export interface PartSummary {
   active?: boolean;
   locked?: boolean;
   trackable?: boolean;
+  hasImage?: true;
   placements?: StockPlacement[];
 }
 
@@ -151,10 +152,12 @@ export function normalizeStock(stock: unknown, fallbackUnits?: string): StockPla
     ...(optionalString(item.batch) ? { batch: optionalString(item.batch) } : {}),
     ...(optionalString(item.serial) ? { serial: optionalString(item.serial) } : {}),
     ...(optionalString(item.packaging) ? { packaging: optionalString(item.packaging) } : {}),
-    ...(optionalString(item.status_text) ? { status: optionalString(item.status_text) } : {}),
+    ...(optionalString(item.status_text) && optionalString(item.status_text) !== "OK"
+      ? { status: optionalString(item.status_text) }
+      : {}),
     ...(optionalString(item.expiry_date) ? { expiryDate: optionalString(item.expiry_date) } : {}),
-    ...(item.allocated !== undefined ? { allocated: numberValue(item.allocated) } : {}),
-    ...(typeof item.expired === "boolean" ? { expired: item.expired } : {}),
+    ...(numberValue(item.allocated) > 0 ? { allocated: numberValue(item.allocated) } : {}),
+    ...(item.expired === true ? { expired: true } : {}),
   };
 }
 
@@ -175,13 +178,14 @@ export function normalizePart(partValue: unknown, stockValues: unknown[] = []): 
     ...(categoryRef(part) ? { category: categoryRef(part) } : {}),
     totalQuantity,
     ...(units ? { units } : {}),
-    ...(part.minimum_stock !== undefined ? { minimumStock: numberValue(part.minimum_stock) } : {}),
+    ...(numberValue(part.minimum_stock) > 0 ? { minimumStock: numberValue(part.minimum_stock) } : {}),
     ...(entityRef(part.default_location_detail)
       ? { defaultLocation: entityRef(part.default_location_detail) }
       : {}),
-    ...(typeof part.active === "boolean" ? { active: part.active } : {}),
-    ...(typeof part.locked === "boolean" ? { locked: part.locked } : {}),
-    ...(typeof part.trackable === "boolean" ? { trackable: part.trackable } : {}),
+    ...(part.active === false ? { active: false } : {}),
+    ...(part.locked === true ? { locked: true } : {}),
+    ...(part.trackable === true ? { trackable: true } : {}),
+    ...(optionalString(part.image) || optionalString(part.thumbnail) ? { hasImage: true as const } : {}),
     ...(placements.length ? { placements } : {}),
   };
 }
@@ -244,6 +248,7 @@ export function formatPartInventory(part: PartSummary, notes?: string, parameter
     ...(part.active === false ? ["- Status: inactive"] : []),
     ...(part.locked ? ["- Editing: locked"] : []),
     ...(part.trackable ? ["- Tracking: serialized"] : []),
+    ...(part.hasImage ? ["- Image: available via get_part_image"] : []),
     "",
     "Stock:",
   ];

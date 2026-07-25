@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -51,7 +51,10 @@ describe("OAuth-protected InvenTree MCP", () => {
     units: "pcs",
     minimum_stock: 50,
     total_in_stock: 200,
+    image: "/media/part_images/test.png",
+    thumbnail: "/media/part_images/test-thumb.png",
   };
+  const pngImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
   const stockItem = {
     pk: 91,
     part: 42,
@@ -72,6 +75,7 @@ describe("OAuth-protected InvenTree MCP", () => {
   const printedLabelBodies: unknown[] = [];
   const patchedLocationIds: string[] = [];
   const transferredStockBodies: unknown[] = [];
+  const partImagePatches: Array<{ contentType: string; body: Buffer }> = [];
   fakeInvenTree.use((req, res, next) => {
     if (req.header("authorization") !== "Token correct-inventree-token") {
       res.status(401).json({ detail: "Invalid token" });
@@ -89,12 +93,24 @@ describe("OAuth-protected InvenTree MCP", () => {
       : [];
     res.json({ count: results.length, next: null, previous: null, results });
   });
-  fakeInvenTree.get("/api/part/category/:id/", (_req, res) => res.json(category));
+  fakeInvenTree.get("/api/part/category/:id/", (req, res) => {
+    if (req.params.id === "99999999") return res.status(404).json({ detail: "No category matches" });
+    return res.json(req.params.id === "13" ? { ...category, pk: 13, name: "Electronics", pathstring: "Electronics", parent: null, level: 0, structural: true } : category);
+  });
   fakeInvenTree.get("/api/stock/location/tree/", (_req, res) =>
     res.json({ count: 1, next: null, previous: null, results: [location] }),
   );
   fakeInvenTree.get("/api/stock/location/", (req, res) => {
-    const results = req.query.cascade === "true"
+    const results = req.query.parent === "1" && req.query.cascade === "true"
+      ? Array.from({ length: 66 }, (_, index) => ({
+          ...location,
+          pk: 3000 + index,
+          name: `Branch ${index + 1}`,
+          pathstring: index < 6 ? `Root/Branch ${index + 1}` : `Root/Branch ${(index % 6) + 1}/Bin ${index + 1}`,
+          parent: index < 6 ? 1 : 3000 + (index % 6),
+          level: index < 6 ? 1 : 2,
+        }))
+      : req.query.cascade === "true"
       ? [
           { ...location, pk: 80, name: "Blue cabinet", pathstring: "Living room/Blue cabinet", parent: 22, level: 1 },
           location,
@@ -102,8 +118,14 @@ describe("OAuth-protected InvenTree MCP", () => {
       : [];
     res.json({ count: results.length, next: null, previous: null, results });
   });
-  fakeInvenTree.get("/api/stock/location/:id/", (_req, res) => res.json(location));
-  fakeInvenTree.get("/api/part/:id/", (_req, res) => res.json(part));
+  fakeInvenTree.get("/api/stock/location/:id/", (req, res) => {
+    if (req.params.id === "99999999") return res.status(404).json({ detail: "No StockLocation matches" });
+    return res.json(req.params.id === "1" ? { ...location, pk: 1, name: "Root", pathstring: "Root", parent: null, level: 0, structural: true } : location);
+  });
+  fakeInvenTree.get("/api/part/:id/", (req, res) => {
+    if (req.params.id === "99999999") return res.status(404).json({ detail: "No Part matches", barcode_hash: "must-not-leak" });
+    return res.json(part);
+  });
   fakeInvenTree.get("/api/part/", (req, res) => {
     const results = req.query.search === "New capacitor" ? [] : [{ ...part, query: req.query.search }];
     res.json({ count: results.length, next: null, previous: null, results });
@@ -137,6 +159,10 @@ describe("OAuth-protected InvenTree MCP", () => {
   });
   fakeInvenTree.post("/api/part/", (req, res) => res.status(201).json({ ...req.body, pk: 1001 }));
   fakeInvenTree.post("/api/stock/", (req, res) => res.status(201).json([{ ...req.body, pk: 1002 }]));
+  fakeInvenTree.patch("/api/part/:id/", express.raw({ type: () => true, limit: "10mb" }), (req, res) => {
+    partImagePatches.push({ contentType: req.header("content-type") ?? "", body: Buffer.from(req.body) });
+    res.json({ ...part, pk: Number(req.params.id) });
+  });
   fakeInvenTree.post("/api/stock/location/", (req, res) => res.status(201).json({ ...req.body, pk: 2001 }));
   fakeInvenTree.patch("/api/stock/location/:id/", (req, res) => {
     patchedLocationIds.push(req.params.id);
@@ -155,6 +181,9 @@ describe("OAuth-protected InvenTree MCP", () => {
   fakeInvenTree.post("/api/label/print/", (req, res) => {
     printedLabelBodies.push(req.body);
     res.status(201).json(req.body);
+  });
+  fakeInvenTree.get(["/media/part_images/test.png", "/media/part_images/test-thumb.png"], (_req, res) => {
+    res.type("image/png").send(pngImage);
   });
   const upstreamServer = createServer(fakeInvenTree);
   let upstreamUrl = "";
@@ -179,6 +208,8 @@ describe("OAuth-protected InvenTree MCP", () => {
     ],
     allowedMcpOrigins: ["https://chatgpt.com"],
     enableRawWrite: false,
+    imageUploadMaxBytes: 8 * 1024 * 1024,
+    imageMaxPixels: 40_000_000,
   };
 
   before(async () => {
@@ -237,6 +268,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       ["/oauth/register", "POST", "content-type"],
       ["/oauth/token", "POST", "content-type"],
       ["/oauth/revoke", "POST", "content-type"],
+      ["/part-images/upload", "PUT", "content-type,x-file-name"],
       ["/mcp", "POST", "authorization,content-type,mcp-protocol-version"],
     ] as const;
 
@@ -381,12 +413,16 @@ describe("OAuth-protected InvenTree MCP", () => {
       "browse_stock_locations",
       "find_parts",
       "get_part_inventory",
+      "get_part_image",
       "inventory_at_location",
       "check_stock_levels",
       "get_stock_history",
       "scan_barcode",
       "create_part_with_stock",
       "update_part",
+      "prepare_part_image_upload",
+      "get_part_image_upload_status",
+      "set_part_image",
       "receive_stock",
       "consume_stock",
       "move_stock",
@@ -419,6 +455,27 @@ describe("OAuth-protected InvenTree MCP", () => {
     const commitTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "commit_inventory_plan");
     assert.equal(stageTool.annotations.destructiveHint, false);
     assert.equal(commitTool.annotations.destructiveHint, true);
+    const createTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "create_part_with_stock");
+    const categoryIdSchema = createTool.inputSchema.properties.part.properties.category_id;
+    assert.deepEqual(categoryIdSchema.anyOf.map((entry: { type: string }) => entry.type), ["integer", "string"]);
+    const initialNotesSchema = createTool.inputSchema.properties.initial_stock.anyOf
+      .find((entry: { type?: string }) => entry.type === "object").properties.notes;
+    const initialNoteTypes = initialNotesSchema.anyOf?.map((entry: { type: string }) => entry.type) ?? initialNotesSchema.type;
+    assert.deepEqual(initialNoteTypes, ["string", "null"]);
+    const assertPreciseFields = (schema: unknown, path = "inputSchema") => {
+      if (!schema || typeof schema !== "object") return;
+      const object = schema as Record<string, unknown>;
+      const properties = object.properties as Record<string, unknown> | undefined;
+      for (const [name, value] of Object.entries(properties ?? {})) {
+        if (/(_id|_ids|notes)$/.test(name)) {
+          assert.ok(value && typeof value === "object" && Object.keys(value as object).length > 0, `${path}.${name} was published as unknown`);
+        }
+        assertPreciseFields(value, `${path}.${name}`);
+      }
+      if (Array.isArray(object.anyOf)) object.anyOf.forEach((value, index) => assertPreciseFields(value, `${path}.anyOf[${index}]`));
+      if (object.items) assertPreciseFields(object.items, `${path}.items`);
+    };
+    tools.body.result.tools.forEach((tool: { name: string; inputSchema: unknown }) => assertPreciseFields(tool.inputSchema, tool.name));
 
     const search = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",
@@ -428,6 +485,12 @@ describe("OAuth-protected InvenTree MCP", () => {
     });
     assert.equal(search.body.result.structuredContent.data.results[0].id, 42);
     assert.equal(search.body.result.structuredContent.data.results[0].placements[0].stockItemId, 91);
+    assert.equal(search.body.result.structuredContent.data.results[0].active, undefined);
+    assert.equal(search.body.result.structuredContent.data.results[0].locked, undefined);
+    assert.equal(search.body.result.structuredContent.data.results[0].trackable, undefined);
+    assert.equal(search.body.result.structuredContent.data.results[0].placements[0].allocated, undefined);
+    assert.equal(search.body.result.structuredContent.data.results[0].placements[0].expired, undefined);
+    assert.equal(search.body.result.structuredContent.data.results[0].placements[0].status, undefined);
     assert.match(search.body.result.content[0].text, /Drawer A3 \(#81\)/);
 
     const refusedWrite = await mcpRequest(token.body.access_token, {
@@ -508,6 +571,30 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.equal(duplicate.body.result.structuredContent.data.duplicate_operation, true);
     assert.equal(duplicate.body.result.structuredContent.data.plan_version, planVersion);
 
+    const staleAppend = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 16,
+      method: "tools/call",
+      params: {
+        name: "receive_stock",
+        arguments: {
+          plan_id: planId,
+          expected_version: 999,
+          operation_id: "different-stale-operation",
+          part_id: 42,
+          quantity: 1,
+          location_id: 81,
+          merge: "compatible",
+        },
+      },
+    });
+    assert.deepEqual(staleAppend.body.result.structuredContent.data, {
+      status: "conflict",
+      conflict_type: "plan_version",
+      expected_version: 999,
+      current_version: planVersion,
+    });
+
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
       id: 11,
@@ -546,6 +633,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       params: { name: "commit_inventory_plan", arguments: { plan_id: stalePlanId, expected_version: stalePlanVersion } },
     });
     assert.equal(staleCommit.body.result.isError, true);
+    assert.equal(staleCommit.body.result.structuredContent.data.status, "conflict");
     assert.match(staleCommit.body.result.content[0].text, /plan is stale/i);
     assert.equal(stockItem.quantity, 206);
   });
@@ -589,6 +677,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     });
     assert.equal(print.body.result.structuredContent.data.plan_version, 2);
     assert.match(print.body.result.content[0].text, /New capacitor.*Drawer A3/);
+    assert.doesNotMatch(print.body.result.content[0].text, /Append related steps/);
 
     const review = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
@@ -656,6 +745,8 @@ describe("OAuth-protected InvenTree MCP", () => {
       },
     });
     assert.equal(refused.body.result.isError, true);
+    assert.equal(refused.body.result.structuredContent.data.status, "conflict");
+    assert.deepEqual(refused.body.result.structuredContent.data.dependent_step_ids, [dependentId]);
     assert.match(refused.body.result.content[0].text, new RegExp(dependentId));
 
     const cascaded = await mcpRequest(accessToken, {
@@ -778,6 +869,196 @@ describe("OAuth-protected InvenTree MCP", () => {
       items: [{ pk: 91, quantity: String(stockItem.quantity) }],
       location: 2001,
     });
+  });
+
+  it("returns structured domain errors and bounds rooted tree expansions", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+
+    const missingPart = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 60,
+      method: "tools/call",
+      params: { name: "get_part_inventory", arguments: { part_id: 99999999 } },
+    });
+    assert.deepEqual(missingPart.body.result.structuredContent.data, {
+      status: "not_found",
+      entity_type: "part",
+      supplied_id: 99999999,
+      suggested_tool: "find_parts",
+    });
+    assert.doesNotMatch(JSON.stringify(missingPart.body.result), /barcode_hash|No Part matches/);
+
+    const missingLocation = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 61,
+      method: "tools/call",
+      params: { name: "inventory_at_location", arguments: { location_id: 99999999 } },
+    });
+    assert.equal(missingLocation.body.result.structuredContent.data.status, "not_found");
+    assert.equal(missingLocation.body.result.structuredContent.data.suggested_tool, "browse_stock_locations");
+
+    const barcode = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 62,
+      method: "tools/call",
+      params: { name: "scan_barcode", arguments: { barcode: "unknown-private-barcode" } },
+    });
+    assert.equal(barcode.body.result.structuredContent.data.status, "not_found");
+    assert.doesNotMatch(JSON.stringify(barcode.body.result), /unknown-private-barcode|barcode_hash/);
+
+    const duplicate = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 63,
+      method: "tools/call",
+      params: {
+        name: "create_part_with_stock",
+        arguments: {
+          operation_id: "duplicate-part-probe",
+          part: { name: "10k resistor", category_id: 15 },
+        },
+      },
+    });
+    assert.equal(duplicate.body.result.structuredContent.data.conflict_type, "possible_duplicates");
+    assert.deepEqual(duplicate.body.result.structuredContent.data.candidates, [{ id: 42, name: "10k resistor" }]);
+
+    const tree = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 64,
+      method: "tools/call",
+      params: {
+        name: "browse_stock_locations",
+        arguments: { root_id: 1, include_item_counts: true, max_level: 2 },
+      },
+    });
+    assert.equal(tree.body.result.structuredContent.data.truncated, true);
+    assert.equal(tree.body.result.structuredContent.data.nodes.length, 6);
+    assert.deepEqual(tree.body.result.structuredContent.data.expandableRootIds, [3000, 3001, 3002, 3003, 3004, 3005]);
+    assert.deepEqual(tree.body.result.structuredContent.data.root, { id: 1, name: "Root", path: "Root" });
+    assert.match(tree.body.result.content[0].text, /^## Selected location: Root \(#1\)/);
+  });
+
+  it("downloads part images and commits temporary uploads as multipart data", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+
+    const image = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 70,
+      method: "tools/call",
+      params: { name: "get_part_image", arguments: { part_id: 42 } },
+    });
+    assert.equal(image.body.result.structuredContent.data.status, "ready");
+    assert.equal(image.body.result.structuredContent.data.delivery, "inline");
+    assert.equal(image.body.result.structuredContent.data.download_url, undefined);
+    assert.equal(image.body.result.structuredContent.data.mime_type, "image/png");
+    assert.equal(image.body.result.structuredContent.data.width, 1);
+    assert.equal(image.body.result.content[1].type, "image");
+    assert.equal(image.body.result.content[1].data, pngImage.toString("base64"));
+
+    const previewImage = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 71,
+      method: "tools/call",
+      params: { name: "get_part_image", arguments: { part_id: 42, variant: "preview" } },
+    });
+    assert.equal(previewImage.body.result.structuredContent.data.delivery, "inline");
+    assert.equal(previewImage.body.result.content[1].type, "image");
+
+    const original = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 72,
+      method: "tools/call",
+      params: { name: "get_part_image", arguments: { part_id: 42, variant: "original" } },
+    });
+    assert.equal(original.body.result.structuredContent.data.delivery, "download_url");
+    assert.equal(original.body.result.content[1].type, "resource_link");
+    const downloadUrl = new URL(original.body.result.structuredContent.data.download_url);
+    assert.equal(downloadUrl.origin, config.publicUrl.origin);
+    const download = await request(app)
+      .get(`${downloadUrl.pathname}${downloadUrl.search}`)
+      .expect("Content-Type", /image\/png/)
+      .expect(200);
+    assert.deepEqual(download.body, pngImage);
+    const contentDisposition = download.header["content-disposition"];
+    assert.ok(contentDisposition);
+    assert.match(contentDisposition, /^inline; filename=/);
+
+    const prepared = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 73,
+      method: "tools/call",
+      params: { name: "prepare_part_image_upload", arguments: { filename: "replacement.png" } },
+    });
+    assert.equal(prepared.body.result.structuredContent.data.status, "awaiting_upload");
+    assert.equal(prepared.body.result.structuredContent.data.method, "PUT");
+    const uploadRef = prepared.body.result.structuredContent.data.upload_ref as string;
+    const uploadUrl = new URL(prepared.body.result.structuredContent.data.upload_url);
+    assert.equal(uploadUrl.origin, config.publicUrl.origin);
+    const uploadPath = `${uploadUrl.pathname}${uploadUrl.search}`;
+
+    const page = await request(app).get(uploadPath).expect(200);
+    assert.match(page.text, /Upload a part image/);
+    const contentSecurityPolicy = page.header["content-security-policy"];
+    assert.ok(contentSecurityPolicy);
+    assert.match(contentSecurityPolicy, /connect-src 'self'/);
+
+    const invalidUpload = await request(app)
+      .put(uploadPath)
+      .set("Content-Type", "image/png")
+      .send(Buffer.from("not-an-image"))
+      .expect(400);
+    assert.equal(invalidUpload.body.data.status, "invalid_image");
+
+    const upload = await request(app)
+      .put(uploadPath)
+      .set("Content-Type", "image/png")
+      .set("X-File-Name", "replacement.png")
+      .send(pngImage)
+      .expect(201);
+    assert.equal(upload.body.data.status, "ready");
+    assert.equal(upload.body.data.width, 1);
+    assert.equal(upload.body.data.upload_ref, uploadRef);
+
+    const status = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 74,
+      method: "tools/call",
+      params: { name: "get_part_image_upload_status", arguments: { upload_ref: uploadRef } },
+    });
+    assert.equal(status.body.result.structuredContent.data.status, "ready");
+    assert.equal(status.body.result.structuredContent.data.filename, "replacement.png");
+    assert.doesNotMatch(requestLogs.join(""), new RegExp(uploadUrl.searchParams.get("token")!));
+    assert.doesNotMatch(requestLogs.join(""), new RegExp(downloadUrl.searchParams.get("token")!));
+
+    const staged = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 75,
+      method: "tools/call",
+      params: {
+        name: "set_part_image",
+        arguments: { operation_id: "replace-part-image", part_id: "42", upload_ref: uploadRef },
+      },
+    });
+    assert.equal(staged.body.result.structuredContent.data.status, "staged");
+    assert.match(staged.body.result.content[0].text, /replacement\.png/);
+    assert.doesNotMatch(readFileSync(config.dataFile, "utf8"), new RegExp(pngImage.toString("base64").slice(0, 24)));
+
+    const commit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 76,
+      method: "tools/call",
+      params: {
+        name: "commit_inventory_plan",
+        arguments: {
+          plan_id: staged.body.result.structuredContent.data.plan_id,
+          expected_version: 1,
+        },
+      },
+    });
+    assert.equal(commit.body.result.structuredContent.data.status, "committed");
+    const multipart = partImagePatches.at(-1)!;
+    assert.match(multipart.contentType, /^multipart\/form-data; boundary=/);
+    assert.match(multipart.body.toString("latin1"), /name="image"; filename="replacement\.png"/);
+    assert.notEqual(multipart.body.indexOf(pngImage), -1);
   });
 
   it("does not create a plan for an already-current stock count", async () => {

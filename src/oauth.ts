@@ -79,6 +79,10 @@ export class OAuthService {
 
   getCredentials(authInfo: AuthInfo): { baseUrl: string; apiToken: string } {
     const credentialsId = String(authInfo.extra?.credentialsId ?? "");
+    return this.getCredentialsById(credentialsId);
+  }
+
+  getCredentialsById(credentialsId: string): { baseUrl: string; apiToken: string } {
     const stored = this.store.snapshot.credentials[credentialsId];
     if (!stored) throw new Error("Linked InvenTree credentials no longer exist");
     return {

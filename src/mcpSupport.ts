@@ -1,4 +1,5 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { DomainError } from "./domainErrors.js";
 import { InvenTreeClient, InvenTreeError } from "./inventree.js";
 import type { OAuthService } from "./oauth.js";
 
@@ -33,8 +34,33 @@ export function result(data: unknown, message: string) {
   };
 }
 
+function sanitizedDetails(value: unknown, depth = 0): unknown {
+  if (depth > 3) return "[truncated]";
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return value.slice(0, 500);
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => sanitizedDetails(item, depth + 1));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => !/(barcode|hash|token|secret|password)/i.test(key))
+        .slice(0, 30)
+        .map(([key, child]) => [key, sanitizedDetails(child, depth + 1)]),
+    );
+  }
+  return String(value).slice(0, 500);
+}
+
 export function errorResult(error: unknown, oauth: OAuthService) {
-  const details = error instanceof InvenTreeError ? error.details : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const domainData = error instanceof DomainError ? error.data : undefined;
+  const upstreamData = error instanceof InvenTreeError
+    ? {
+        status: "upstream_error",
+        ...(error.status ? { http_status: error.status } : {}),
+        ...(error.details === undefined ? {} : { details: sanitizedDetails(error.details) }),
+      }
+    : undefined;
+  const data = domainData ?? upstreamData ?? { status: "error", message };
   const challenge =
     error instanceof BridgeScopeError
       ? {
@@ -45,13 +71,11 @@ export function errorResult(error: unknown, oauth: OAuthService) {
       : undefined;
   return {
     isError: true,
-    structuredContent: { error: (error as Error).message, details },
+    structuredContent: { data },
     content: [
       {
         type: "text" as const,
-        text: details
-          ? `${(error as Error).message}: ${JSON.stringify(details).slice(0, 2_000)}`
-          : (error as Error).message,
+        text: message,
       },
     ],
     ...(challenge ? { _meta: challenge } : {}),

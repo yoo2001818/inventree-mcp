@@ -28,6 +28,7 @@ Read tools return compact Markdown plus minimal normalized structured data. Cate
 | `browse_stock_locations` | Browse or search the physical-location hierarchy |
 | `find_parts` | Find parts with aggregate quantities and stock placements |
 | `get_part_inventory` | Fetch one useful part card and every stock placement |
+| `get_part_image` | Return thumbnails/previews inline or an expiring URL for the original image |
 | `inventory_at_location` | List what is physically stored at a location or subtree |
 | `check_stock_levels` | Find depleted or below-minimum parts |
 | `get_stock_history` | Explain stock changes with a compact timeline |
@@ -40,6 +41,9 @@ Dedicated write tools append stable steps to a short-lived shared plan. Staging 
 | --- | --- |
 | `create_part_with_stock` | Create a part and optional initial stock after duplicate checks |
 | `update_part` | Change useful home-inventory part metadata |
+| `prepare_part_image_upload` | Create an expiring browser/PUT upload URL and `upload_ref` |
+| `get_part_image_upload_status` | Check whether a temporary upload is ready to stage |
+| `set_part_image` | Stage a multipart part-image replacement from a temporary upload |
 | `receive_stock` | Add newly acquired quantity or create a stock item |
 | `consume_stock` | Remove used/discarded quantity with an explicit allocation |
 | `move_stock` | Move stock while preserving total quantity |
@@ -55,6 +59,8 @@ Dedicated write tools append stable steps to a short-lived shared plan. Staging 
 | `inventree_write` | Optional advanced raw POST/PATCH/PUT escape hatch; no DELETE |
 
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
+
+Part-image bytes never enter MCP JSON arguments or the persisted plan store. Call `prepare_part_image_upload` to receive an expiring, credential-scoped `upload_ref` and capability URL. A person can open that URL and choose a file, while a native client can `PUT` raw PNG, JPEG, GIF, or extended WebP bytes to the same URL without an OAuth header. The capability token is unguessable, short-lived, and omitted from HTTP access logs. After upload, pass the already-known reference to `set_part_image`, review the shared plan normally, and commit once. For reads, `get_part_image` returns thumbnails and previews immediately as base64 MCP image content; only `variant: "original"` returns a short-lived direct-download URL and MCP resource link. `IMAGE_UPLOAD_MAX_BYTES` and `IMAGE_MAX_PIXELS` configure the in-memory bounds.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
 
@@ -135,6 +141,7 @@ The end-to-end test starts a fake InvenTree server and exercises DCR, authorizat
 - `INVENTREE_URL` fixes the upstream instance for every linked credential; authorization requests cannot select another host.
 - MCP requests with an `Origin` header are rejected with HTTP 403 unless the exact origin appears in `ALLOWED_MCP_ORIGINS`.
 - CORS preflights allow the browser headers required by MCP Inspector, including authorization, content type, protocol version, session ID, and event resumption headers.
+- Part images are signature-checked, byte- and pixel-limited, held only in memory for 30 minutes, and uploaded to InvenTree as multipart data only during a confirmed plan commit. Media reads accept only same-origin `/media/` paths returned by the authenticated part API.
 - Access logs include method, pathname, status, response size, and duration. Query parameters, authorization headers, and request bodies are not logged.
 - DCR accepts only callback origins listed in `ALLOWED_REDIRECT_ORIGINS`; `https://chatgpt.com` is the default.
 - Registrations are rate-limited in memory and capped to prevent unbounded persistent state. For a hardened deployment, also rate-limit at the reverse proxy and optionally restrict the endpoint to OpenAI's published egress ranges.

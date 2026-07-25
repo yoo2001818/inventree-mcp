@@ -22,6 +22,8 @@ describe("configuration", () => {
     ]);
     assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com"]);
     assert.equal(config.enableRawWrite, false);
+    assert.equal(config.imageUploadMaxBytes, 8 * 1024 * 1024);
+    assert.equal(config.imageMaxPixels, 40_000_000);
   });
 
   it("loads explicit bind and MCP Origin settings", () => {
@@ -73,6 +75,17 @@ describe("configuration", () => {
           ALLOWED_REDIRECT_ORIGINS: "https://example.com:*",
         }),
       /ALLOWED_REDIRECT_ORIGINS entries must be exact HTTP\(S\) origins without paths/,
+    );
+  });
+
+  it("validates image safety limits", () => {
+    assert.throws(
+      () => loadConfig({ ...validEnvironment, IMAGE_UPLOAD_MAX_BYTES: "0" }),
+      /IMAGE_UPLOAD_MAX_BYTES must be a positive integer/,
+    );
+    assert.throws(
+      () => loadConfig({ ...validEnvironment, IMAGE_MAX_PIXELS: "many" }),
+      /IMAGE_MAX_PIXELS must be a positive integer/,
     );
   });
 });

@@ -51,6 +51,10 @@ export interface MutationRequest {
   method: "POST" | "PATCH" | "PUT";
   path: string | MutationPathSegment[];
   body: unknown;
+  imageUpload?: {
+    uploadRef: string;
+    field: "image";
+  };
 }
 
 export type MutationPathSegment = string | { __planRef: string };

@@ -15,11 +15,19 @@ export interface Config {
   allowedRedirectOrigins: string[];
   allowedMcpOrigins: string[];
   enableRawWrite: boolean;
+  imageUploadMaxBytes: number;
+  imageMaxPixels: number;
 }
 
 function required(name: string, value: string | undefined): string {
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+
+function positiveInteger(name: string, value: string | undefined, fallback: number): number {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+  return parsed;
 }
 
 function exactOrigins(name: string, value: string): string[] {
@@ -111,6 +119,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.ALLOWED_MCP_ORIGINS ?? "https://chatgpt.com",
     ),
     enableRawWrite: env.ENABLE_RAW_WRITE?.trim().toLowerCase() === "true",
+    imageUploadMaxBytes: positiveInteger("IMAGE_UPLOAD_MAX_BYTES", env.IMAGE_UPLOAD_MAX_BYTES, 8 * 1024 * 1024),
+    imageMaxPixels: positiveInteger("IMAGE_MAX_PIXELS", env.IMAGE_MAX_PIXELS, 40_000_000),
   };
 }
 

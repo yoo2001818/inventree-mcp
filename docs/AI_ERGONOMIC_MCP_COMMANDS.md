@@ -116,7 +116,7 @@ Suggested input:
 }
 ```
 
-All fields are optional. Without `root_id`, `search`, or `full_tree: true`, return only top-level nodes with child/item counts. A search result should include matched branches with enough ancestors to preserve context. `max_level` deliberately mirrors InvenTree's zero-based level semantics; it is not a relative depth count. The connector must enforce this bound after fetching, including when counts require an InvenTree list endpoint that ignores `max_level`. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for top-level orientation, counts, or details.
+All fields are optional. Without `root_id`, `search`, or `full_tree: true`, return only top-level nodes with child/item counts. A selected `root_id` is repeated as a heading and as compact structured root metadata so the result remains self-contained. A search result should include matched branches with enough ancestors to preserve context. `max_level` deliberately mirrors InvenTree's zero-based level semantics; it is not a relative depth count. The connector must enforce this bound after fetching, including when counts require an InvenTree list endpoint that ignores `max_level`. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for top-level orientation, counts, or details.
 
 Canonical output:
 
@@ -147,6 +147,8 @@ Suggested input mirrors `browse_part_categories`:
 ```
 
 Use `/api/stock/location/tree/` for hierarchy and `/api/stock/location/` for optional counts and details.
+
+Both tree tools enforce a hard 40-node response bound. When a depth-matched result is larger, return only its shallow orientation nodes, set `truncated: true`, and provide `expandableRootIds` for focused follow-up calls.
 
 Canonical output:
 
@@ -493,6 +495,25 @@ The tool should discover enabled templates from `/api/label/template/`, filtered
 
 Printing is a real-world side effect. Always preview the entity names/paths, printer, template dimensions/name, and copy count before commit.
 
+## Part image workflow
+
+### `get_part_image`
+
+Inputs: numeric `part_id` and `variant: "thumbnail" | "preview" | "original"`, defaulting to `thumbnail`. For `thumbnail` and `preview`, the connector downloads the trusted InvenTree media path during the MCP call, validates its byte bound, signature, dimensions, and MIME consistency, and returns one base64 MCP image content block plus compact metadata. The client needs no follow-up HTTP request.
+
+For `original`, the connector instead returns an MCP resource link plus a short-lived direct-download URL. This avoids expanding a potentially large original file into base64 inside the MCP response. The URL contains an unguessable capability token, requires no OAuth header, and proxies only the stored credential's trusted InvenTree media path. Capability query strings are excluded from access logs. No variant accepts an arbitrary caller-supplied URL.
+
+### `prepare_part_image_upload`, upload status, and `set_part_image`
+
+`prepare_part_image_upload(filename?)` requires `inventree.write` and returns both an opaque `upload_ref` and an expiring capability URL. The reference is known before any bytes are uploaded, so an agent can continue composing its workflow without inventing a future value. The URL works in two modes:
+
+- opening it in a browser presents a small file picker and uploads the selected image;
+- sending `PUT` to it uploads raw bytes with the real image `Content-Type` and optional `X-File-Name` header.
+
+The capability URL itself authorizes that single temporary upload, so the browser or native HTTP client does not need access to the MCP OAuth bearer token. An invalid image does not consume the session; a successfully completed upload cannot be replaced through the same URL. `get_part_image_upload_status(upload_ref)` returns `pending` or safe ready metadata without exposing image bytes.
+
+Upload tokens are random, stored only as hashes, scoped to the credential link, excluded from request logs, and expire after 30 minutes. Uploads are signature-checked, byte- and pixel-limited, held only in memory, and never stored in mutation-plan JSON. `set_part_image(part_id, upload_ref, ...plan fields)` stages a normal shared-plan step whose preview includes the existing-image state, filename, MIME type, dimensions, byte size, and replacement side effect. Commit resolves a future part ref if necessary, sends multipart form data to InvenTree, and removes the temporary bytes only after the upstream request succeeds.
+
 ## Mutation safety protocol
 
 Mutation tools stage steps in one shared plan. Staging changes only temporary bridge state, is non-destructive, and must not ask the user for confirmation. If `plan_id` is omitted, the first staging call creates a plan; later calls append to it.
@@ -546,6 +567,7 @@ Every staging tool accepts these plan-control fields alongside its workflow fiel
 - Reusing `operation_id` for the same operation returns its existing step rather than appending a duplicate.
 - Reusing an operation ID for different content is an error.
 - A successful append increments `plan_version` and refreshes idle expiry.
+- The first staged response includes concise append/review guidance. Later responses omit that repeated paragraph because plan status, ID, and version already convey the next action.
 
 The response is informational, not a confirmation request. MCP structured responses use one consistent `{ data: ... }` envelope:
 
@@ -694,6 +716,8 @@ Tools should return actionable domain outcomes rather than raw HTTP errors:
 
 Expected domain failures should not dump a serializer or stack trace. Authentication and scope failures should continue to use MCP authorization metadata.
 
+Expected errors use the same `structuredContent.data` envelope as successes. Plan-version conflicts include `expected_version` and `current_version`; dependency conflicts include `dependent_step_ids`; possible duplicates include compact `{id, name}` candidates; missing entities include their supplied ID and suggested lookup tool. Unknown barcode errors never echo an upstream barcode hash or the supplied barcode.
+
 ## Pagination and output limits
 
 - Prefer opaque cursors at the MCP boundary even if InvenTree uses numeric offsets internally.
@@ -702,6 +726,7 @@ Expected domain failures should not dump a serializer or stack trace. Authentica
 - Put a hard node limit on trees. If exceeded, return top levels and tell the model which `root_id` values can be expanded.
 - Never embed upstream `next` URLs; they leak deployment details and are not useful to the model.
 - Sort trees in stable path/name order and histories newest first.
+- Omit non-differentiating structured defaults such as `active: true`, `locked: false`, `trackable: false`, `allocated: 0`, `expired: false`, and stock status `OK`.
 
 ## Example composed workflows
 

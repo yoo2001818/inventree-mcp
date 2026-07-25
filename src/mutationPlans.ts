@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { randomToken } from "./crypto.js";
+import { DomainError, versionConflict } from "./domainErrors.js";
 import { InvenTreeClient } from "./inventree.js";
+import type { PartImageUploads } from "./partImages.js";
 import type { OAuthService } from "./oauth.js";
 import type {
   InventoryEntityType,
@@ -98,7 +100,7 @@ export function stagePlan(
       }
       if (input.expectedVersion === undefined) throw new Error("expected_version is required when appending to a plan");
       if (plan.version !== input.expectedVersion) {
-        throw new Error(`Inventory plan version changed: expected ${input.expectedVersion}, current ${plan.version}`);
+        throw versionConflict(input.expectedVersion, plan.version);
       }
     } else {
       plan = {
@@ -159,7 +161,7 @@ export function stageResult(staged: { plan: MutationPlan; step: MutationStep; du
     content: [
       {
         type: "text" as const,
-        text: `${duplicate ? "Already staged" : `Staged step ${plan.steps.findIndex((candidate) => candidate.id === step.id) + 1}`} (${step.id}) in plan ${plan.id}, version ${plan.version}.\n${step.summary}${outputText}\n\nContinue appending steps with this plan ID and version, or review the plan before its single final commit.`,
+        text: `${duplicate ? "Already staged" : `Staged step ${plan.steps.findIndex((candidate) => candidate.id === step.id) + 1}`} (${step.id}) in plan ${plan.id}, version ${plan.version}.\n${step.summary}${outputText}${plan.steps.length === 1 ? "\n\nAppend related steps with this plan ID and version, then review once before the final commit." : ""}`,
       },
     ],
   };
@@ -275,7 +277,7 @@ export function removePlanStep(
     if (!plan) throw new Error("Inventory plan was not found or expired");
     if (plan.credentialsId !== owner) throw new Error("Inventory plan belongs to another credential link");
     if (plan.state !== "staging") throw new Error(`Inventory plan cannot be edited while it is ${plan.state}`);
-    if (plan.version !== expectedVersion) throw new Error(`Inventory plan version changed: expected ${expectedVersion}, current ${plan.version}`);
+    if (plan.version !== expectedVersion) throw versionConflict(expectedVersion, plan.version);
     const target = plan.steps.find((step) => step.id === stepId);
     if (!target) throw new Error(`Plan step was not found: ${stepId}`);
     const removeIds = new Set([stepId]);
@@ -285,7 +287,10 @@ export function removePlanStep(
       changed = false;
       for (const step of plan.steps) {
         if (removeIds.has(step.id)) continue;
-        const dependencies = step.requests.flatMap((request) => [...referencedPlanRefs(request.body)]);
+        const dependencies = step.requests.flatMap((request) => [
+          ...referencedPlanRefs(request.path),
+          ...referencedPlanRefs(request.body),
+        ]);
         if (dependencies.some((ref) => removedRefs.has(ref))) {
           removeIds.add(step.id);
           step.outputs.forEach((output) => removedRefs.add(output.ref));
@@ -295,7 +300,10 @@ export function removePlanStep(
     }
     const dependents = [...removeIds].filter((id) => id !== stepId);
     if (dependents.length && !cascade) {
-      throw new Error(`Cannot remove ${stepId}; dependent steps: ${dependents.join(", ")}. Set cascade=true to remove them too.`);
+      throw new DomainError(
+        { status: "conflict", conflict_type: "dependent_steps", step_id: stepId, dependent_step_ids: dependents },
+        `Cannot remove ${stepId}; dependent steps: ${dependents.join(", ")}. Set cascade=true to remove them too.`,
+      );
     }
     plan.steps = plan.steps.filter((step) => !removeIds.has(step.id));
     plan.version += 1;
@@ -318,11 +326,12 @@ export async function commitPlan(
   client: InvenTreeClient,
   planId: string,
   expectedVersion: number,
+  imageUploads?: PartImageUploads,
 ): Promise<{ plan: MutationPlan; result: MutationCommitResult }> {
   const plan = requireOwnedPlan(oauth, authInfo, planId);
   if (plan.state === "committed" && plan.commitResult) return { plan, result: plan.commitResult };
   if (plan.state !== "staging") throw new Error(`Inventory plan cannot be committed while it is ${plan.state}`);
-  if (plan.version !== expectedVersion) throw new Error(`Inventory plan version changed: expected ${expectedVersion}, current ${plan.version}`);
+  if (plan.version !== expectedVersion) throw versionConflict(expectedVersion, plan.version);
   if (!plan.steps.length) throw new Error("Inventory plan has no steps to commit");
 
   // Claim the plan synchronously before the first await so concurrent commits
@@ -335,7 +344,10 @@ export async function commitPlan(
     for (const check of plan.steps.flatMap((step) => step.checks)) {
       const current = await client.get(check.path, check.query);
       if (digest(current) !== check.digest) {
-        throw new Error(`Inventory plan is stale because ${check.path} changed; prepare a new plan`);
+        throw new DomainError(
+          { status: "conflict", conflict_type: "stale_inventory", changed_path: check.path },
+          `Inventory plan is stale because ${check.path} changed; prepare a new plan`,
+        );
       }
     }
   } catch (error) {
@@ -363,9 +375,30 @@ export async function commitPlan(
       const request = step.requests[requestIndex]!;
       const body = resolveReferences(request.body, stepResults, refs);
       try {
-        const response = await client.write(request.method, resolveRequestPath(request.path, refs), body);
-        stepResults.push(response);
+        const requestPath = resolveRequestPath(request.path, refs);
+        const upload = request.imageUpload
+          ? imageUploads?.get(request.imageUpload.uploadRef, credentialsId(authInfo))
+          : undefined;
+        if (request.imageUpload && !upload) throw new Error("Image uploads are unavailable for this commit");
+        const response = upload
+          ? await client.writeMultipart(request.method, requestPath, {
+              field: request.imageUpload!.field,
+              bytes: upload.bytes,
+              filename: upload.filename,
+              mimeType: upload.mimeType,
+            })
+          : await client.write(request.method, requestPath, body);
         completedRequests += 1;
+        if (upload) {
+          const responseRecord = response !== null && typeof response === "object"
+            ? response as Record<string, unknown>
+            : {};
+          if (typeof responseRecord.image !== "string" || !responseRecord.image || typeof responseRecord.thumbnail !== "string" || !responseRecord.thumbnail) {
+            throw new Error("InvenTree accepted the image request but did not return verified image and thumbnail paths");
+          }
+          imageUploads!.remove(upload.ref);
+        }
+        stepResults.push(response);
         const directId = extractPath(response, ["pk"]);
         if (typeof directId === "number") resultIds.push(directId);
         for (const output of step.outputs.filter((candidate) => candidate.requestIndex === requestIndex)) {
