@@ -33,6 +33,7 @@ describe("OAuth-protected InvenTree MCP", () => {
   const upstreamServer = createServer(fakeInvenTree);
   let upstreamUrl = "";
   let app: ReturnType<typeof createApp>["app"];
+  const requestLogs: string[] = [];
 
   const config: Config = {
     publicUrl: new URL("https://mcp.example.test"),
@@ -45,7 +46,11 @@ describe("OAuth-protected InvenTree MCP", () => {
     dataFile: join(directory, "state.json"),
     accessTokenTtlSeconds: 3600,
     refreshTokenTtlSeconds: 86_400,
-    allowedRedirectOrigins: ["https://chatgpt.com"],
+    allowedRedirectOrigins: [
+      "https://chatgpt.com",
+      "http://localhost:*",
+      "http://127.0.0.1:*",
+    ],
     allowedMcpOrigins: ["https://chatgpt.com"],
   };
 
@@ -54,7 +59,9 @@ describe("OAuth-protected InvenTree MCP", () => {
     const address = upstreamServer.address() as AddressInfo;
     upstreamUrl = `http://127.0.0.1:${address.port}`;
     config.inventreeUrl = upstreamUrl;
-    app = createApp(config).app;
+    app = createApp(config, undefined, {
+      requestLogStream: { write: (message) => requestLogs.push(message) },
+    }).app;
   });
 
   after(async () => {
@@ -65,14 +72,26 @@ describe("OAuth-protected InvenTree MCP", () => {
   });
 
   it("publishes OAuth discovery and challenges unauthenticated MCP requests", async () => {
-    const metadata = await request(app).get("/.well-known/oauth-authorization-server").expect(200);
+    const metadata = await request(app)
+      .get("/.well-known/oauth-authorization-server")
+      .set("Origin", "https://chatgpt.com")
+      .expect(200);
     assert.equal(metadata.body.authorization_endpoint, "https://mcp.example.test/oauth/authorize");
     assert.deepEqual(metadata.body.code_challenge_methods_supported, ["S256"]);
+    assert.equal(metadata.header["access-control-allow-origin"], "https://chatgpt.com");
 
-    const response = await request(app).post("/mcp").send({}).expect(401);
+    const response = await request(app)
+      .post("/mcp")
+      .set("Origin", "https://chatgpt.com")
+      .send({})
+      .expect(401);
     const challenge = response.header["www-authenticate"];
     assert.ok(challenge);
     assert.match(challenge, /oauth-protected-resource/);
+    assert.equal(response.header["access-control-allow-origin"], "https://chatgpt.com");
+    const exposedHeaders = response.header["access-control-expose-headers"];
+    assert.ok(exposedHeaders);
+    assert.match(exposedHeaders, /WWW-Authenticate/i);
 
     const invalidOrigin = await request(app)
       .get("/mcp")
@@ -80,6 +99,65 @@ describe("OAuth-protected InvenTree MCP", () => {
       .set("Accept", "text/event-stream")
       .expect(403);
     assert.equal(invalidOrigin.body.error.message, "Invalid Origin header: https://attacker.example");
+    assert.equal(invalidOrigin.header["access-control-allow-origin"], undefined);
+  });
+
+  it("supports Inspector CORS preflights for MCP and OAuth endpoints", async () => {
+    const cases = [
+      ["/.well-known/oauth-protected-resource", "GET", ""],
+      ["/.well-known/oauth-authorization-server", "GET", ""],
+      ["/.well-known/openid-configuration", "GET", ""],
+      ["/oauth/register", "POST", "content-type"],
+      ["/oauth/token", "POST", "content-type"],
+      ["/oauth/revoke", "POST", "content-type"],
+      ["/mcp", "POST", "authorization,content-type,mcp-protocol-version"],
+    ] as const;
+
+    for (const [path, method, headers] of cases) {
+      const preflight = request(app)
+        .options(path)
+        .set("Origin", "https://chatgpt.com")
+        .set("Access-Control-Request-Method", method);
+      if (headers) preflight.set("Access-Control-Request-Headers", headers);
+
+      const response = await preflight.expect(204);
+      assert.equal(response.header["access-control-allow-origin"], "https://chatgpt.com");
+      const allowedMethods = response.header["access-control-allow-methods"];
+      assert.ok(allowedMethods);
+      assert.match(allowedMethods, new RegExp(method));
+      assert.match(response.header.vary ?? "", /Origin/);
+    }
+  });
+
+  it("allows dynamic loopback callback ports but rejects other HTTP hosts", async () => {
+    for (const redirectUri of [
+      "http://localhost:49152/oauth/callback",
+      "http://127.0.0.1:54321/oauth/callback",
+    ]) {
+      const registration = await request(app)
+        .post("/oauth/register")
+        .send({ client_name: "Local Codex", redirect_uris: [redirectUri] })
+        .expect(201);
+      assert.deepEqual(registration.body.redirect_uris, [redirectUri]);
+    }
+
+    const rejected = await request(app)
+      .post("/oauth/register")
+      .send({
+        client_name: "Non-loopback client",
+        redirect_uris: ["http://192.168.1.10:49152/oauth/callback"],
+      })
+      .expect(400);
+    assert.equal(rejected.body.error, "invalid_redirect_uri");
+  });
+
+  it("logs request metadata without query parameters", async () => {
+    await request(app).get("/healthz?api_token=must-not-be-logged").expect(200);
+
+    const log = requestLogs.find((message) => message.includes("GET /healthz 200"));
+    assert.ok(log);
+    assert.match(log, /^\d{4}-\d{2}-\d{2}T.* GET \/healthz 200 \d+b \d+\.\d{3}ms\n$/);
+    assert.doesNotMatch(log, /api_token|must-not-be-logged/);
   });
 
   it("completes DCR, authorization-code PKCE, token exchange, and an MCP tool call", async () => {
@@ -127,6 +205,7 @@ describe("OAuth-protected InvenTree MCP", () => {
 
     const token = await request(app)
       .post("/oauth/token")
+      .set("Origin", "https://chatgpt.com")
       .type("form")
       .send({
         grant_type: "authorization_code",
@@ -140,6 +219,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.equal(token.body.token_type, "Bearer");
     assert.ok(token.body.access_token);
     assert.ok(token.body.refresh_token);
+    assert.equal(token.header["access-control-allow-origin"], "https://chatgpt.com");
 
     const getResponse = await request(app)
       .get("/mcp")

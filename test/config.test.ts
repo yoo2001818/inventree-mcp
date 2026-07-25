@@ -15,6 +15,11 @@ describe("configuration", () => {
 
     assert.equal(config.inventreeUrl, "https://inventree.example.test/instance");
     assert.equal(config.bindHost, "127.0.0.1");
+    assert.deepEqual(config.allowedRedirectOrigins, [
+      "https://chatgpt.com",
+      "http://localhost:*",
+      "http://127.0.0.1:*",
+    ]);
     assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com"]);
   });
 
@@ -51,6 +56,17 @@ describe("configuration", () => {
           ALLOWED_MCP_ORIGINS: "https://chatgpt.com/connector",
         }),
       /ALLOWED_MCP_ORIGINS entries must be exact HTTP\(S\) origins without paths/,
+    );
+  });
+
+  it("rejects redirect wildcard patterns outside the supported loopback hosts", () => {
+    assert.throws(
+      () =>
+        loadConfig({
+          ...validEnvironment,
+          ALLOWED_REDIRECT_ORIGINS: "https://example.com:*",
+        }),
+      /ALLOWED_REDIRECT_ORIGINS entries must be exact HTTP\(S\) origins without paths/,
     );
   });
 });

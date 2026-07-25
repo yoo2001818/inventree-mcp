@@ -7,7 +7,9 @@ const { app } = createApp(config);
 const server = app.listen(config.port, config.bindHost, () => {
   console.log(`InvenTree MCP listening on ${config.bindHost}:${config.port}`);
   console.log(`Public MCP endpoint: ${config.resourceUrl}`);
-  console.log(`Owner password fingerprint: ${ownerPasswordFingerprint(config)}`);
+  console.log(
+    `Owner password fingerprint: ${ownerPasswordFingerprint(config)}`,
+  );
 });
 
 function shutdown(signal: string) {

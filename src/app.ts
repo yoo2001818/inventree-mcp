@@ -1,8 +1,14 @@
-import express, { type NextFunction, type Request, type Response } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import cors from "cors";
 import helmet from "helmet";
 import type { Config } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { OAuthService } from "./oauth.js";
+import { createRequestLogger } from "./requestLogger.js";
 import { JsonStore } from "./store.js";
 import { ChatGptStreamableTransport } from "./transport.js";
 
@@ -12,13 +18,22 @@ export interface AppServices {
   oauth: OAuthService;
 }
 
-export function createApp(config: Config, store = new JsonStore(config.dataFile)) {
+export interface AppOptions {
+  requestLogStream?: { write(message: string): void };
+}
+
+export function createApp(
+  config: Config,
+  store = new JsonStore(config.dataFile),
+  options: AppOptions = {},
+) {
   const app = express();
   const oauth = new OAuthService(config, store);
   const resourceMetadataUrl = `${config.publicUrl.origin}/.well-known/oauth-protected-resource`;
 
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
+  app.use(createRequestLogger(options.requestLogStream));
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -45,6 +60,28 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
     }
     next();
   });
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        callback(
+          null,
+          origin !== undefined && config.allowedMcpOrigins.includes(origin),
+        );
+      },
+      methods: ["GET", "POST", "DELETE", "OPTIONS"],
+      allowedHeaders: [
+        "Accept",
+        "Authorization",
+        "Content-Type",
+        "Last-Event-ID",
+        "MCP-Protocol-Version",
+        "MCP-Session-Id",
+      ],
+      exposedHeaders: ["Location", "MCP-Session-Id", "WWW-Authenticate"],
+      maxAge: 600,
+      optionsSuccessStatus: 204,
+    }),
+  );
   app.use(express.json({ limit: "1mb" }));
   app.use(oauth.router);
 
@@ -66,7 +103,10 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
         "WWW-Authenticate",
         `Bearer resource_metadata="${resourceMetadataUrl}", scope="inventree.read"`,
       );
-      res.status(401).json({ error: "invalid_token", error_description: "Bearer token required" });
+      res.status(401).json({
+        error: "invalid_token",
+        error_description: "Bearer token required",
+      });
       return;
     }
     try {
@@ -77,7 +117,10 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
         "WWW-Authenticate",
         `Bearer error="invalid_token", error_description="${String((error as Error).message).replaceAll('"', "")}", resource_metadata="${resourceMetadataUrl}"`,
       );
-      res.status(401).json({ error: "invalid_token", error_description: (error as Error).message });
+      res.status(401).json({
+        error: "invalid_token",
+        error_description: (error as Error).message,
+      });
     }
   };
 
@@ -106,11 +149,14 @@ export function createApp(config: Config, store = new JsonStore(config.dataFile)
     }
   });
   const methodNotAllowed = (_req: Request, res: Response) => {
-    res.set("Allow", "POST").status(405).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed." },
-      id: null,
-    });
+    res
+      .set("Allow", "POST")
+      .status(405)
+      .json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Method not allowed." },
+        id: null,
+      });
   };
   app.get("/mcp", authenticate, methodNotAllowed);
   app.delete("/mcp", authenticate, methodNotAllowed);

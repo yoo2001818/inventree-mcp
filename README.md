@@ -8,8 +8,10 @@ The service is intentionally self-contained for a single owner:
 - OAuth 2.1 authorization-code flow with S256 PKCE
 - Dynamic client registration (DCR) for ChatGPT
 - OAuth protected-resource and authorization-server discovery
+- Exact-origin CORS support for browser-based MCP and OAuth clients
 - A single server-configured InvenTree URL, with API tokens entered during authorization
 - InvenTree credential validation through `/api/user/me/`
+- HTTP access logs with query strings, headers, and bodies excluded
 - AES-256-GCM encryption at rest for the InvenTree token
 - Hashed, short-lived OAuth access tokens and rotating refresh tokens
 - Persistent JSON state designed for one container instance
@@ -44,7 +46,7 @@ openssl rand -base64 32  # use as ENCRYPTION_KEY
 openssl rand -base64 32  # use as OWNER_PASSWORD
 ```
 
-Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Set `INVENTREE_URL` to the one InvenTree instance reachable from the bridge container, such as `http://inventree-server:8000`. End users cannot override this URL; changing it and restarting the service moves all existing credential links to the new instance. `ALLOWED_MCP_ORIGINS` is a comma-separated allowlist for requests that include an `Origin` header. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
+Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Set `INVENTREE_URL` to the one InvenTree instance reachable from the bridge container, such as `http://inventree-server:8000`. End users cannot override this URL; changing it and restarting the service moves all existing credential links to the new instance. `ALLOWED_MCP_ORIGINS` is a comma-separated allowlist used for MCP Origin validation and browser CORS across the MCP, OAuth, and discovery endpoints. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
 
 Start the service:
 
@@ -85,7 +87,7 @@ npm run dev
 
 `npm run dev` loads the Git-ignored `.env` file. Copy `.env.example` to `.env` and set its values if the file does not exist yet.
 
-For local OAuth testing, add the inspector's exact origin to both `ALLOWED_REDIRECT_ORIGINS` and `ALLOWED_MCP_ORIGINS`. The default permits only `https://chatgpt.com`. Local development binds to `127.0.0.1` by default; Docker Compose overrides `BIND_HOST` to `0.0.0.0` inside the container while publishing the port only on host loopback.
+For local OAuth testing, `ALLOWED_REDIRECT_ORIGINS` supports the two special loopback patterns `http://localhost:*` and `http://127.0.0.1:*`, allowing Inspector, Codex, and other native clients to choose ephemeral callback ports. No other wildcard forms are accepted. Browser clients still need their exact origin in `ALLOWED_MCP_ORIGINS` for CORS. Local development binds to `127.0.0.1` by default; Docker Compose overrides `BIND_HOST` to `0.0.0.0` inside the container while publishing the port only on host loopback.
 
 Run the checks:
 
@@ -103,6 +105,8 @@ The end-to-end test starts a fake InvenTree server and exercises DCR, authorizat
 - `OWNER_PASSWORD` gates authorization and is rate-limited in memory after failed attempts.
 - `INVENTREE_URL` fixes the upstream instance for every linked credential; authorization requests cannot select another host.
 - MCP requests with an `Origin` header are rejected with HTTP 403 unless the exact origin appears in `ALLOWED_MCP_ORIGINS`.
+- CORS preflights allow the browser headers required by MCP Inspector, including authorization, content type, protocol version, session ID, and event resumption headers.
+- Access logs include method, pathname, status, response size, and duration. Query parameters, authorization headers, and request bodies are not logged.
 - DCR accepts only callback origins listed in `ALLOWED_REDIRECT_ORIGINS`; `https://chatgpt.com` is the default.
 - Registrations are rate-limited in memory and capped to prevent unbounded persistent state. For a hardened deployment, also rate-limit at the reverse proxy and optionally restrict the endpoint to OpenAI's published egress ranges.
 - InvenTree tokens are encrypted with AES-256-GCM. OAuth bearer and refresh tokens are stored only as SHA-256 hashes.

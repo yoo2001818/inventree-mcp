@@ -362,11 +362,18 @@ export class OAuthService {
 
   private assertAllowedRedirectUri(value: string): void {
     const url = new URL(value);
-    if (!this.config.allowedRedirectOrigins.includes(url.origin)) {
+    const isLoopbackHttp =
+      url.protocol === "http:" &&
+      (url.hostname === "localhost" || url.hostname === "127.0.0.1");
+    const loopbackPattern = `http://${url.hostname}:*`;
+    if (
+      !this.config.allowedRedirectOrigins.includes(url.origin) &&
+      !(isLoopbackHttp && this.config.allowedRedirectOrigins.includes(loopbackPattern))
+    ) {
       throw new Error(`Redirect origin ${url.origin} is not allowed`);
     }
-    if (url.protocol !== "https:" && url.hostname !== "localhost") {
-      throw new Error("Redirect URI must use HTTPS");
+    if (url.protocol !== "https:" && !isLoopbackHttp) {
+      throw new Error("Redirect URI must use HTTPS or an HTTP loopback address");
     }
     if (
       url.origin === "https://chatgpt.com" &&

@@ -27,11 +27,43 @@ function exactOrigins(name: string, value: string): string[] {
     .map((origin) => origin.trim())
     .filter(Boolean)
     .map((origin) => {
-      const url = new URL(origin);
+      let url: URL;
+      try {
+        url = new URL(origin);
+      } catch {
+        throw new Error(`${name} entries must be exact HTTP(S) origins without paths`);
+      }
       if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== origin) {
         throw new Error(`${name} entries must be exact HTTP(S) origins without paths`);
       }
       return origin;
+    });
+}
+
+const LOOPBACK_REDIRECT_PATTERNS = new Set([
+  "http://localhost:*",
+  "http://127.0.0.1:*",
+]);
+
+function redirectOrigins(value: string): string[] {
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .map((origin) => {
+      if (LOOPBACK_REDIRECT_PATTERNS.has(origin)) return origin;
+
+      const [exactOrigin] = exactOrigins("ALLOWED_REDIRECT_ORIGINS", origin);
+      const url = new URL(exactOrigin!);
+      const isLoopbackHttp =
+        url.protocol === "http:" &&
+        (url.hostname === "localhost" || url.hostname === "127.0.0.1");
+      if (url.protocol !== "https:" && !isLoopbackHttp) {
+        throw new Error(
+          "ALLOWED_REDIRECT_ORIGINS entries must use HTTPS or an HTTP loopback origin",
+        );
+      }
+      return exactOrigin!;
     });
 }
 
@@ -56,10 +88,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const inventreeUrl = normalizeInvenTreeUrl(required("INVENTREE_URL", env.INVENTREE_URL));
-  const allowedRedirectOrigins = (env.ALLOWED_REDIRECT_ORIGINS ?? "https://chatgpt.com")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const allowedRedirectOrigins = redirectOrigins(
+    env.ALLOWED_REDIRECT_ORIGINS ??
+      "https://chatgpt.com,http://localhost:*,http://127.0.0.1:*",
+  );
 
   return {
     publicUrl,
