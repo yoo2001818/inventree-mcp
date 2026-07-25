@@ -69,6 +69,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     updated: "2026-01-01 00:00",
     in_stock: true,
   };
+  const printedLabelBodies: unknown[] = [];
   fakeInvenTree.use((req, res, next) => {
     if (req.header("authorization") !== "Token correct-inventree-token") {
       res.status(401).json({ detail: "Invalid token" });
@@ -86,14 +87,10 @@ describe("OAuth-protected InvenTree MCP", () => {
   );
   fakeInvenTree.get("/api/stock/location/:id/", (_req, res) => res.json(location));
   fakeInvenTree.get("/api/part/:id/", (_req, res) => res.json(part));
-  fakeInvenTree.get("/api/part/", (req, res) =>
-    res.json({
-      count: 1,
-      next: null,
-      previous: null,
-      results: [{ ...part, query: req.query.search }],
-    }),
-  );
+  fakeInvenTree.get("/api/part/", (req, res) => {
+    const results = req.query.search === "New capacitor" ? [] : [{ ...part, query: req.query.search }];
+    res.json({ count: results.length, next: null, previous: null, results });
+  });
   fakeInvenTree.get("/api/stock/:id/", (_req, res) => res.json(stockItem));
   fakeInvenTree.get("/api/stock/", (_req, res) =>
     res.json({ count: 1, next: null, previous: null, results: [stockItem] }),
@@ -102,6 +99,18 @@ describe("OAuth-protected InvenTree MCP", () => {
     const adjustment = req.body.items?.[0];
     stockItem.quantity += Number(adjustment?.quantity ?? 0);
     part.total_in_stock = stockItem.quantity;
+    res.status(201).json(req.body);
+  });
+  fakeInvenTree.post("/api/part/", (req, res) => res.status(201).json({ ...req.body, pk: 1001 }));
+  fakeInvenTree.post("/api/stock/", (req, res) => res.status(201).json([{ ...req.body, pk: 1002 }]));
+  fakeInvenTree.get("/api/label/template/", (_req, res) => res.json({
+    count: 1,
+    next: null,
+    previous: null,
+    results: [{ pk: 20, name: "Stock 30x15", width: 30, height: 15, enabled: true }],
+  }));
+  fakeInvenTree.post("/api/label/print/", (req, res) => {
+    printedLabelBodies.push(req.body);
     res.status(201).json(req.body);
   });
   const upstreamServer = createServer(fakeInvenTree);
@@ -345,7 +354,10 @@ describe("OAuth-protected InvenTree MCP", () => {
       "create_stock_location",
       "update_stock_location",
       "print_labels",
-      "commit_inventory_change",
+      "review_inventory_plan",
+      "remove_inventory_plan_step",
+      "discard_inventory_plan",
+      "commit_inventory_plan",
       "inventree_get",
     ]) {
       assert.ok(toolNames.includes(expected), `missing tool ${expected}`);
@@ -360,6 +372,10 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.deepEqual(searchTool.securitySchemes, [
       { type: "oauth2", scopes: ["inventree.read"] },
     ]);
+    const stageTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "receive_stock");
+    const commitTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "commit_inventory_plan");
+    assert.equal(stageTool.annotations.destructiveHint, false);
+    assert.equal(commitTool.annotations.destructiveHint, true);
 
     const search = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",
@@ -381,6 +397,7 @@ describe("OAuth-protected InvenTree MCP", () => {
           part_id: 42,
           quantity: 1,
           location_id: 81,
+          operation_id: "refused-write",
         },
       },
     });
@@ -403,7 +420,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.notEqual(refresh.body.refresh_token, token.body.refresh_token);
   });
 
-  it("previews, revalidates, and commits a dedicated stock workflow exactly once", async () => {
+  it("stages, revalidates, and commits a shared stock plan idempotently", async () => {
     const accessToken = await authorizeToken("inventree.read inventree.write");
 
     const preview = await mcpRequest(accessToken, {
@@ -418,18 +435,41 @@ describe("OAuth-protected InvenTree MCP", () => {
           location_id: 81,
           merge: "compatible",
           notes: "Integration test",
+          operation_id: "receive-five",
         },
       },
     });
-    assert.equal(preview.body.result.structuredContent.status, "confirmation_required");
+    assert.equal(preview.body.result.structuredContent.status, "staged");
     assert.match(preview.body.result.content[0].text, /200 pcs -> 205 pcs/);
     const planId = preview.body.result.structuredContent.plan_id as string;
+    const planVersion = preview.body.result.structuredContent.plan_version as number;
+
+    const duplicate = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 15,
+      method: "tools/call",
+      params: {
+        name: "receive_stock",
+        arguments: {
+          plan_id: planId,
+          expected_version: 999,
+          operation_id: "receive-five",
+          part_id: 42,
+          quantity: 5,
+          location_id: 81,
+          merge: "compatible",
+          notes: "Integration test",
+        },
+      },
+    });
+    assert.equal(duplicate.body.result.structuredContent.duplicate_operation, true);
+    assert.equal(duplicate.body.result.structuredContent.plan_version, planVersion);
 
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
       id: 11,
       method: "tools/call",
-      params: { name: "commit_inventory_change", arguments: { plan_id: planId } },
+      params: { name: "commit_inventory_plan", arguments: { plan_id: planId, expected_version: planVersion } },
     });
     assert.equal(commit.body.result.structuredContent.data.status, "committed");
     assert.equal(stockItem.quantity, 205);
@@ -438,10 +478,9 @@ describe("OAuth-protected InvenTree MCP", () => {
       jsonrpc: "2.0",
       id: 12,
       method: "tools/call",
-      params: { name: "commit_inventory_change", arguments: { plan_id: planId } },
+      params: { name: "commit_inventory_plan", arguments: { plan_id: planId, expected_version: planVersion } },
     });
-    assert.equal(replay.body.result.isError, true);
-    assert.match(replay.body.result.content[0].text, /not found, expired, or already used/);
+    assert.equal(replay.body.result.structuredContent.data.status, "committed");
     assert.equal(stockItem.quantity, 205);
 
     const stalePreview = await mcpRequest(accessToken, {
@@ -450,21 +489,161 @@ describe("OAuth-protected InvenTree MCP", () => {
       method: "tools/call",
       params: {
         name: "receive_stock",
-        arguments: { part_id: 42, quantity: 1, location_id: 81, merge: "compatible" },
+        arguments: { part_id: 42, quantity: 1, location_id: 81, merge: "compatible", operation_id: "stale-receive" },
       },
     });
     const stalePlanId = stalePreview.body.result.structuredContent.plan_id as string;
+    const stalePlanVersion = stalePreview.body.result.structuredContent.plan_version as number;
     stockItem.quantity = 206;
     part.total_in_stock = 206;
     const staleCommit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
       id: 14,
       method: "tools/call",
-      params: { name: "commit_inventory_change", arguments: { plan_id: stalePlanId } },
+      params: { name: "commit_inventory_plan", arguments: { plan_id: stalePlanId, expected_version: stalePlanVersion } },
     });
     assert.equal(staleCommit.body.result.isError, true);
-    assert.match(staleCommit.body.result.content[0].text, /plan is stale/);
+    assert.match(staleCommit.body.result.content[0].text, /plan is stale/i);
     assert.equal(stockItem.quantity, 206);
+  });
+
+  it("resolves a future stock reference when a later plan step prints its label", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+    const create = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: {
+        name: "create_part_with_stock",
+        arguments: {
+          operation_id: "create-new-capacitor",
+          part: { name: "New capacitor", category_id: 15, units: "pcs" },
+          initial_stock: { quantity: 10, location_id: 81, packaging: "cut tape" },
+        },
+      },
+    });
+    assert.equal(create.body.result.structuredContent.status, "staged");
+    const planId = create.body.result.structuredContent.plan_id as string;
+    const stockRef = create.body.result.structuredContent.outputs.find(
+      (output: { name: string }) => output.name === "stock_item",
+    ).ref as string;
+
+    const print = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: {
+        name: "print_labels",
+        arguments: {
+          plan_id: planId,
+          expected_version: 1,
+          operation_id: "print-new-capacitor-stock",
+          entity_type: "stock_item",
+          entities: [{ ref: stockRef }],
+          template: "30x15mm",
+        },
+      },
+    });
+    assert.equal(print.body.result.structuredContent.plan_version, 2);
+    assert.match(print.body.result.content[0].text, /New capacitor.*Drawer A3/);
+
+    const review = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "review_inventory_plan", arguments: { plan_id: planId } },
+    });
+    assert.equal(review.body.result.structuredContent.data.steps.length, 2);
+
+    const commit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: { name: "commit_inventory_plan", arguments: { plan_id: planId, expected_version: 2 } },
+    });
+    assert.equal(commit.body.result.structuredContent.data.resolved_refs[stockRef], 1002);
+    assert.deepEqual(printedLabelBodies.at(-1), { template: 20, plugin: "zebra", items: [1002] });
+  });
+
+  it("uses immutable step IDs and protects dependent future references during plan edits", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+    const create = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: {
+        name: "create_part_with_stock",
+        arguments: {
+          operation_id: "create-removal-test",
+          part: { name: "New capacitor", category_id: 15 },
+          initial_stock: { quantity: 1, location_id: 81 },
+        },
+      },
+    });
+    const planId = create.body.result.structuredContent.plan_id as string;
+    const producerId = create.body.result.structuredContent.step_id as string;
+    const stockRef = create.body.result.structuredContent.outputs.find(
+      (output: { name: string }) => output.name === "stock_item",
+    ).ref as string;
+    const print = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "print_labels",
+        arguments: {
+          plan_id: planId,
+          expected_version: 1,
+          operation_id: "print-removal-test",
+          entity_type: "stock_item",
+          entities: [{ ref: stockRef }],
+          template: "30x15mm",
+        },
+      },
+    });
+    const dependentId = print.body.result.structuredContent.step_id as string;
+
+    const refused = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "remove_inventory_plan_step",
+        arguments: { plan_id: planId, expected_version: 2, step_id: producerId },
+      },
+    });
+    assert.equal(refused.body.result.isError, true);
+    assert.match(refused.body.result.content[0].text, new RegExp(dependentId));
+
+    const cascaded = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 33,
+      method: "tools/call",
+      params: {
+        name: "remove_inventory_plan_step",
+        arguments: { plan_id: planId, expected_version: 2, step_id: producerId, cascade: true },
+      },
+    });
+    assert.deepEqual(cascaded.body.result.structuredContent.data.remaining_step_ids, []);
+    assert.equal(cascaded.body.result.structuredContent.data.plan_version, 3);
+  });
+
+  it("does not create a plan for an already-current stock count", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+    const counted = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 40,
+      method: "tools/call",
+      params: {
+        name: "count_stock",
+        arguments: {
+          operation_id: "no-op-count",
+          counts: [{ stock_item_id: 91, observed_quantity: stockItem.quantity }],
+        },
+      },
+    });
+    assert.equal(counted.body.result.structuredContent.data.status, "already_current");
+    assert.equal(counted.body.result.structuredContent.plan_id, undefined);
   });
 
   async function authorizeToken(scope: string): Promise<string> {

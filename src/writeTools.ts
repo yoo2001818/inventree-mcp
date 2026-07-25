@@ -14,13 +14,33 @@ import {
   type JsonRecord,
 } from "./inventoryDomain.js";
 import type { InvenTreeClient } from "./inventree.js";
-import { captureCheck, commitPlan, planResult, savePlan } from "./mutationPlans.js";
+import {
+  captureCheck,
+  commitPlan,
+  discardPlan,
+  removePlanStep,
+  reviewPlan,
+  stagePlan,
+  stageResult,
+  type PlannedOutputInput,
+} from "./mutationPlans.js";
 import type { OAuthService } from "./oauth.js";
 import { clientFor, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import type { MutationCheck, MutationRequest } from "./store.js";
 
 const positiveQuantity = z.number().positive().finite();
 const optionalText = z.string().max(50_000).nullable().optional();
+const planInputFields = {
+  plan_id: z.string().min(16).optional().describe("Existing shared plan to append to; omit to start a new plan"),
+  expected_version: z.number().int().positive().optional().describe("Required with plan_id to prevent lost updates"),
+  operation_id: z.string().min(1).max(100).describe("Caller-stable idempotency key for this staged step"),
+};
+const entitySelectorSchema = z.union([
+  z.object({ id: z.number().int().positive() }).strict(),
+  z.object({ ref: z.string().min(1) }).strict(),
+]);
+
+type PlanInput = { plan_id?: string; expected_version?: number; operation_id: string };
 
 const STATUS_CODES = {
   ok: 10,
@@ -95,8 +115,32 @@ function beforeAfter(label: string, before: unknown, after: unknown): string | u
   return JSON.stringify(left) === JSON.stringify(right) ? undefined : `- ${label}: ${JSON.stringify(left)} -> ${JSON.stringify(right)}`;
 }
 
-function mutationAnnotations(idempotentHint = false) {
-  return { readOnlyHint: false, destructiveHint: true, idempotentHint, openWorldHint: false };
+function mutationAnnotations(idempotentHint = true) {
+  return { readOnlyHint: false, destructiveHint: false, idempotentHint, openWorldHint: false };
+}
+
+function commitAnnotations() {
+  return { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
+}
+
+function stageMutation(
+  oauth: OAuthService,
+  auth: Parameters<typeof stagePlan>[1],
+  input: PlanInput,
+  summary: string,
+  requests: MutationRequest[],
+  checks: MutationCheck[],
+  outputs?: PlannedOutputInput[],
+) {
+  return stageResult(stagePlan(oauth, auth, {
+    planId: input.plan_id,
+    expectedVersion: input.expected_version,
+    operationId: input.operation_id,
+    summary,
+    requests,
+    checks,
+    outputs,
+  }));
 }
 
 export function registerWriteTools(server: McpServer, oauth: OAuthService): void {
@@ -105,8 +149,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     {
       title: "Prepare a new part and initial stock",
       description:
-        "Check for duplicate parts, validate category/location IDs, and prepare creation of a home-inventory part with optional initial stock. This only creates a confirmation plan.",
+        "Check for duplicate parts, validate category/location IDs, and stage creation of a home-inventory part with optional initial stock in a shared plan.",
       inputSchema: {
+        ...planInputFields,
         part: z.object({
           name: z.string().min(1).max(100),
           description: z.string().max(250).default(""),
@@ -213,17 +258,42 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         const summary = [
           `Create part ${input.part.name}`,
           `- Category: ${formatRef(refOrFallback(category, "Category", input.part.category_id))}`,
+          ...(input.part.description ? [`- Description: ${input.part.description}`] : []),
+          ...(input.part.IPN ? [`- IPN: ${input.part.IPN}`] : []),
+          ...(input.part.keywords.length ? [`- Keywords: ${input.part.keywords.join(", ")}`] : []),
+          ...(input.part.units ? [`- Units: ${input.part.units}`] : []),
+          ...(input.part.minimum_stock ? [`- Minimum stock: ${input.part.minimum_stock}`] : []),
+          ...(input.part.maximum_stock ? [`- Maximum stock: ${input.part.maximum_stock}`] : []),
+          ...(input.part.trackable ? ["- Trackable: yes"] : []),
           ...(defaultLocation ? [`- Default location: ${formatRef(refOrFallback(defaultLocation, "Location", input.part.default_location_id!))}`] : []),
+          ...(input.part.link ? [`- Link: ${input.part.link}`] : []),
+          ...(input.part.notes ? [`- Part notes: ${input.part.notes}`] : []),
           ...(input.initial_stock && stockLocation
             ? [
                 `- Initial stock: ${formatQuantity(input.initial_stock.quantity, input.part.units ?? undefined)} in ${formatRef(
                   refOrFallback(stockLocation, "Location", input.initial_stock.location_id),
                 )}`,
+                ...(input.initial_stock.batch ? [`- Stock batch: ${input.initial_stock.batch}`] : []),
+                ...(input.initial_stock.packaging ? [`- Stock packaging: ${input.initial_stock.packaging}`] : []),
+                ...(input.initial_stock.expiry_date ? [`- Stock expiry: ${input.initial_stock.expiry_date}`] : []),
+                ...(input.initial_stock.notes ? [`- Stock notes: ${input.initial_stock.notes}`] : []),
               ]
             : []),
           `- Upstream operations: ${requests.length}`,
         ].join("\n");
-        return planResult(savePlan(oauth, auth, summary, requests, await checksFor(client, checkPaths)));
+        const outputs: PlannedOutputInput[] = [
+          { name: "part", entityType: "part", requestIndex: 0, responsePaths: [["pk"]], display: input.part.name },
+          ...(input.initial_stock
+            ? [{
+                name: "stock_item" as const,
+                entityType: "stock_item" as const,
+                requestIndex: 1,
+                responsePaths: [[0, "pk"], ["pk"]],
+                display: `${input.part.name} in ${formatRef(refOrFallback(stockLocation!, "Location", input.initial_stock.location_id))}`,
+              }]
+            : []),
+        ];
+        return stageMutation(oauth, auth, input, summary, requests, await checksFor(client, checkPaths), outputs);
       }),
   );
 
@@ -233,6 +303,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       title: "Prepare changes to a part",
       description: "Prepare a sparse metadata update for an existing part and show an exact before/after diff.",
       inputSchema: {
+        ...planInputFields,
         part_id: z.number().int().positive(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
@@ -255,8 +326,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
     },
-    async ({ part_id, changes }, extra) =>
+    async (input, extra) =>
       safely(oauth, async () => {
+        const { part_id, changes } = input;
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
         const part = await getPart(client, part_id);
         ensureUnlocked(part);
@@ -308,14 +380,13 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         if (category) checkPaths.push([`/api/part/category/${changes.category_id}/`, { path_detail: true }]);
         if (location) checkPaths.push([`/api/stock/location/${changes.default_location_id}/`, { path_detail: true }]);
         const summary = [`Update ${formatRef(partRef(part))}:`, ...diffs].join("\n");
-        return planResult(
-          savePlan(
-            oauth,
-            auth,
-            summary,
-            [{ method: "PATCH", path: `/api/part/${part_id}/`, body }],
-            await checksFor(client, checkPaths),
-          ),
+        return stageMutation(
+          oauth,
+          auth,
+          input,
+          summary,
+          [{ method: "PATCH", path: `/api/part/${part_id}/`, body }],
+          await checksFor(client, checkPaths),
         );
       }),
   );
@@ -327,6 +398,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description:
         "Prepare adding newly acquired quantity to a compatible stock item or creating a new stock item. IDs are validated and the selected behavior is previewed.",
       inputSchema: {
+        ...planInputFields,
         part_id: z.number().int().positive(),
         quantity: positiveQuantity,
         location_id: z.number().int().positive(),
@@ -419,13 +491,29 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
             `${formatQuantity(numberValue(target.quantity), optionalString(part.units))} -> ${formatQuantity(numberValue(target.quantity) + input.quantity, optionalString(part.units))}`
           : `Receive ${formatQuantity(input.quantity, optionalString(part.units))} of ${formatRef(partRef(part))}\n` +
             `- Create a new stock item in ${formatRef(refOrFallback(location, "Location", input.location_id))}`;
+        const detailedSummary = [
+          summary,
+          ...(input.batch ? [`- Batch: ${input.batch}`] : []),
+          ...(input.packaging ? [`- Packaging: ${input.packaging}`] : []),
+          ...(input.expiry_date ? [`- Expiry: ${input.expiry_date}`] : []),
+          ...(input.notes ? [`- Notes: ${input.notes}`] : []),
+        ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
           [`/api/part/${input.part_id}/`, { category_detail: true, location_detail: true }],
           [`/api/stock/location/${input.location_id}/`, { path_detail: true }],
           ["/api/stock/", query],
         ];
         if (input.stock_item_id) checkPaths.push([`/api/stock/${input.stock_item_id}/`, { part_detail: true, location_detail: true, path_detail: true }]);
-        return planResult(savePlan(oauth, auth, summary, requests, await checksFor(client, checkPaths)));
+        const outputs: PlannedOutputInput[] | undefined = target
+          ? undefined
+          : [{
+              name: "stock_item",
+              entityType: "stock_item",
+              requestIndex: 0,
+              responsePaths: [[0, "pk"], ["pk"]],
+              display: `${formatRef(partRef(part))} in ${formatRef(refOrFallback(location, "Location", input.location_id))}`,
+            }];
+        return stageMutation(oauth, auth, input, detailedSummary, requests, await checksFor(client, checkPaths), outputs);
       }),
   );
 
@@ -436,6 +524,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description:
         "Prepare removal of a used or discarded quantity from eligible stock. Returns an explicit per-stock-item allocation and never consumes unavailable stock.",
       inputSchema: {
+        ...planInputFields,
         part_id: z.number().int().positive(),
         quantity: positiveQuantity,
         location_id: z.number().int().positive().optional(),
@@ -526,24 +615,14 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ["/api/stock/", query],
           ...allocation.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
         ];
-        return planResult(
-          savePlan(
-            oauth,
-            auth,
-            summary,
-            [
-              {
-                method: "POST",
-                path: "/api/stock/remove/",
-                body: {
-                  items: allocation.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
-                  ...(note ? { notes: note } : {}),
-                },
-              },
-            ],
-            await checksFor(client, checkPaths),
-          ),
-        );
+        return stageMutation(oauth, auth, input, summary, [{
+          method: "POST",
+          path: "/api/stock/remove/",
+          body: {
+            items: allocation.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
+            ...(note ? { notes: note } : {}),
+          },
+        }], await checksFor(client, checkPaths));
       }),
   );
 
@@ -554,6 +633,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description:
         "Prepare moving one stock item, a quantity of one part from a source location, or every stock item under a source location. Total quantity is preserved.",
       inputSchema: {
+        ...planInputFields,
         destination_location_id: z.number().int().positive(),
         stock_item_id: z.number().int().positive().optional(),
         part_id: z.number().int().positive().optional(),
@@ -606,6 +686,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
             `- ${formatRef(stockPartRef(item))}: ${formatQuantity(quantity, optionalString(record(item.part_detail).units))} ` +
             `from ${formatRef(stockLocationRef(item))} [stock #${numberValue(item.pk)}]`,
           ),
+          ...(moveItems.some(({ item, quantity }) => quantity < numberValue(item.quantity))
+            ? ["- Partial move: InvenTree will split the source and assign a new stock-item ID at commit."]
+            : ["- Full move: existing stock-item IDs are retained."]),
           ...(input.notes ? [`- Note: ${input.notes}`] : []),
         ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
@@ -613,25 +696,15 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ...moveItems.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
         ];
         if (!input.stock_item_id) checkPaths.push(["/api/stock/", query]);
-        return planResult(
-          savePlan(
-            oauth,
-            auth,
-            summary,
-            [
-              {
-                method: "POST",
-                path: "/api/stock/transfer/",
-                body: {
-                  items: moveItems.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
-                  location: input.destination_location_id,
-                  ...(input.notes ? { notes: input.notes } : {}),
-                },
-              },
-            ],
-            await checksFor(client, checkPaths),
-          ),
-        );
+        return stageMutation(oauth, auth, input, summary, [{
+          method: "POST",
+          path: "/api/stock/transfer/",
+          body: {
+            items: moveItems.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
+            location: input.destination_location_id,
+            ...(input.notes ? { notes: input.notes } : {}),
+          },
+        }], await checksFor(client, checkPaths));
       }),
   );
 
@@ -641,6 +714,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       title: "Prepare a physical stock count",
       description: "Prepare reconciliation of recorded stock quantities with observed physical counts.",
       inputSchema: {
+        ...planInputFields,
         counts: z.array(z.object({ stock_item_id: z.number().int().positive(), observed_quantity: z.number().nonnegative().finite() })).min(1).max(100),
         location_id: z.number().int().positive().optional(),
         notes: optionalText,
@@ -657,37 +731,37 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         if (input.location_id && items.some((item) => numberValue(item.location) !== input.location_id)) {
           throw new Error("One or more stock items are not in the stated stocktake location");
         }
+        const changed = items.flatMap((item, index) => {
+          const count = input.counts[index]!;
+          return numberValue(item.quantity) === count.observed_quantity ? [] : [{ item, count }];
+        });
+        if (!changed.length) {
+          return result(
+            { status: "already_current", unchanged_stock_item_ids: ids },
+            `All ${items.length} observed stock quantities are already current; no plan step was created.`,
+          );
+        }
         const summary = [
-          `Count ${items.length} stock item${items.length === 1 ? "" : "s"}:`,
-          ...items.map((item, index) => {
-            const observed = input.counts[index]!.observed_quantity;
+          `Count ${changed.length} changed stock item${changed.length === 1 ? "" : "s"}:`,
+          ...changed.map(({ item, count }) => {
+            const observed = count.observed_quantity;
             const current = numberValue(item.quantity);
             return `- ${formatRef(stockPartRef(item))} [stock #${numberValue(item.pk)}]: ${current} -> ${observed} (${observed - current >= 0 ? "+" : ""}${observed - current})`;
           }),
           ...(input.notes ? [`- Note: ${input.notes}`] : []),
         ].join("\n");
-        return planResult(
-          savePlan(
-            oauth,
-            auth,
-            summary,
-            [
-              {
-                method: "POST",
-                path: "/api/stock/count/",
-                body: {
-                  items: input.counts.map((count) => ({ pk: count.stock_item_id, quantity: String(count.observed_quantity) })),
-                  ...(input.location_id ? { location: input.location_id } : {}),
-                  ...(input.notes ? { notes: input.notes } : {}),
-                },
-              },
-            ],
-            await checksFor(
-              client,
-              items.map((item) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
-            ),
-          ),
-        );
+        return stageMutation(oauth, auth, input, summary, [{
+          method: "POST",
+          path: "/api/stock/count/",
+          body: {
+            items: changed.map(({ count }) => ({ pk: count.stock_item_id, quantity: String(count.observed_quantity) })),
+            ...(input.location_id ? { location: input.location_id } : {}),
+            ...(input.notes ? { notes: input.notes } : {}),
+          },
+        }], await checksFor(
+          client,
+          changed.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
+        ));
       }),
   );
 
@@ -697,6 +771,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       title: "Prepare stock-status changes",
       description: "Prepare marking stock items OK, damaged, lost, quarantined, or another supported semantic status.",
       inputSchema: {
+        ...planInputFields,
         stock_item_ids: z.array(z.number().int().positive()).min(1).max(100),
         status: z.enum(["ok", "attention_needed", "damaged", "destroyed", "rejected", "lost", "quarantined", "returned"]),
         notes: optionalText,
@@ -715,14 +790,13 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ...items.map((item) => `- ${formatRef(stockPartRef(item))} [stock #${numberValue(item.pk)}]: ${optionalString(item.status_text) ?? item.status} -> ${input.status.replaceAll("_", " ")}`),
           ...(input.notes ? [`- Note: ${input.notes}`] : []),
         ].join("\n");
-        return planResult(
-          savePlan(
-            oauth,
-            auth,
-            summary,
-            [{ method: "POST", path: "/api/stock/change_status/", body: { items: ids, status: statusCode, ...(input.notes ? { note: input.notes } : {}) } }],
-            await checksFor(client, ids.map((id) => [`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>])),
-          ),
+        return stageMutation(
+          oauth,
+          auth,
+          input,
+          summary,
+          [{ method: "POST", path: "/api/stock/change_status/", body: { items: ids, status: statusCode, ...(input.notes ? { note: input.notes } : {}) } }],
+          await checksFor(client, ids.map((id) => [`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>])),
         );
       }),
   );
@@ -731,34 +805,111 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
   registerLabelTool(server, oauth);
 
   server.registerTool(
-    "commit_inventory_change",
+    "review_inventory_plan",
     {
-      title: "Commit a confirmed inventory change",
-      description:
-        "Commit a short-lived mutation plan only after the user confirms its exact preview. Revalidates all relevant upstream state and consumes the plan once.",
+      title: "Review an inventory plan",
+      description: "Show every staged step, immutable step ID, and future entity reference in one shared inventory plan.",
       inputSchema: { plan_id: z.string().min(16) },
-      annotations: mutationAnnotations(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: { securitySchemes: WRITE_SECURITY },
     },
     async ({ plan_id }, extra) =>
       safely(oauth, async () => {
-        const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const committed = await commitPlan(oauth, auth, client, plan_id);
-        const ids = committed.results.flatMap((value) => {
-          if (Array.isArray(value)) return value.map((item) => numberValue(record(item).pk)).filter(Boolean);
-          const id = numberValue(record(value).pk);
-          return id ? [id] : [];
-        });
+        const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const reviewed = reviewPlan(oauth, auth, plan_id);
         return result(
-          { status: "committed", plan_id, result_ids: ids, operation_count: committed.results.length },
-          `${committed.plan.summary}\n\nCommitted successfully.${ids.length ? ` Result IDs: ${ids.map((id) => `#${id}`).join(", ")}.` : ""}`,
+          {
+            status: reviewed.plan.state,
+            plan_id,
+            plan_version: reviewed.plan.version,
+            steps: reviewed.plan.steps.map((step, index) => ({
+              position: index + 1,
+              step_id: step.id,
+              operation_id: step.operationId,
+              summary: step.summary,
+              operation_count: step.requests.length,
+              outputs: step.outputs.map(({ ref, name, entityType, display }) => ({ ref, name, entity_type: entityType, display })),
+            })),
+          },
+          reviewed.text,
         );
       }),
+  );
+
+  server.registerTool(
+    "remove_inventory_plan_step",
+    {
+      title: "Remove a staged inventory-plan step",
+      description: "Remove a step by immutable ID. Dependent steps are rejected unless cascade is explicitly enabled.",
+      inputSchema: {
+        plan_id: z.string().min(16),
+        expected_version: z.number().int().positive(),
+        step_id: z.string().startsWith("stp_"),
+        cascade: z.boolean().default(false),
+      },
+      annotations: mutationAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async (input, extra) => safely(oauth, async () => {
+      const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+      const plan = removePlanStep(oauth, auth, input.plan_id, input.expected_version, input.step_id, input.cascade);
+      return result(
+        { status: "staged", plan_id: plan.id, plan_version: plan.version, remaining_step_ids: plan.steps.map((step) => step.id) },
+        `Removed ${input.step_id}${input.cascade ? " and its dependent steps" : ""}. Plan ${plan.id} is now version ${plan.version} with ${plan.steps.length} steps.`,
+      );
+    }),
+  );
+
+  server.registerTool(
+    "discard_inventory_plan",
+    {
+      title: "Discard an inventory plan",
+      description: "Discard a staged plan without changing InvenTree.",
+      inputSchema: { plan_id: z.string().min(16) },
+      annotations: mutationAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async ({ plan_id }, extra) => safely(oauth, async () => {
+      const { auth } = clientFor(oauth, extra.authInfo, "inventree.write");
+      discardPlan(oauth, auth, plan_id);
+      return result({ status: "discarded", plan_id }, `Discarded inventory plan ${plan_id}. No InvenTree changes were made.`);
+    }),
+  );
+
+  server.registerTool(
+    "commit_inventory_plan",
+    {
+      title: "Commit a reviewed inventory plan",
+      description: "After the user's single final confirmation, revalidate and execute all staged steps serially. Safe retries return the recorded result.",
+      inputSchema: { plan_id: z.string().min(16), expected_version: z.number().int().positive() },
+      annotations: commitAnnotations(),
+      _meta: { securitySchemes: WRITE_SECURITY },
+    },
+    async ({ plan_id, expected_version }, extra) => safely(oauth, async () => {
+      const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+      const committed = await commitPlan(oauth, auth, client, plan_id, expected_version);
+      const resolved = Object.entries(committed.result.resolvedRefs).map(([ref, id]) => `${ref}=#${id}`);
+      return result(
+        {
+          status: committed.result.status,
+          plan_id,
+          plan_version: committed.plan.version,
+          completed_steps: committed.result.completedSteps,
+          completed_requests: committed.result.completedRequests,
+          resolved_refs: committed.result.resolvedRefs,
+          result_ids: committed.result.resultIds,
+          ...(committed.result.failedStepId ? { failed_step_id: committed.result.failedStepId } : {}),
+          ...(committed.result.error ? { error: committed.result.error } : {}),
+        },
+        `Committed ${committed.result.completedSteps} steps (${committed.result.completedRequests} upstream operations) successfully.${resolved.length ? ` Resolved references: ${resolved.join(", ")}.` : ""}`,
+      );
+    }),
   );
 }
 
 function registerStructureTools(server: McpServer, oauth: OAuthService): void {
   const categoryFields = {
+    ...planInputFields,
     name: z.string().min(1).max(100),
     parent_id: z.number().int().positive().nullable().optional(),
     description: z.string().max(250).default(""),
@@ -792,11 +943,17 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
           throw new Error(`A category named ${input.name} already exists under the selected parent`);
         }
         const path = [parent ? stringValue(parent.pathstring) : "", input.name].filter(Boolean).join("/");
-        const summary = `Create part category ${displayPath(path)}\n- Structural: ${input.structural ? "yes" : "no"}`;
+        const summary = [
+          `Create part category ${displayPath(path)}`,
+          `- Structural: ${input.structural ? "yes" : "no"}`,
+          ...(input.description ? [`- Description: ${input.description}`] : []),
+          ...(location ? [`- Default location: ${formatRef(refOrFallback(location, "Location", input.default_location_id!))}`] : []),
+          ...(input.default_keywords ? [`- Default keywords: ${input.default_keywords}`] : []),
+        ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [["/api/part/category/", siblingsQuery]];
         if (parent) checkPaths.push([`/api/part/category/${input.parent_id}/`, { path_detail: true }]);
         if (location) checkPaths.push([`/api/stock/location/${input.default_location_id}/`, { path_detail: true }]);
-        return planResult(savePlan(oauth, auth, summary, [{ method: "POST", path: "/api/part/category/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, ...(input.default_location_id !== undefined ? { default_location: input.default_location_id } : {}), ...(input.default_keywords !== undefined ? { default_keywords: input.default_keywords } : {}) } }], await checksFor(client, checkPaths)));
+        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/part/category/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, ...(input.default_location_id !== undefined ? { default_location: input.default_location_id } : {}), ...(input.default_keywords !== undefined ? { default_keywords: input.default_keywords } : {}) } }], await checksFor(client, checkPaths), [{ name: "part_category", entityType: "part_category", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path) }]);
       }),
   );
 
@@ -806,6 +963,7 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       title: "Prepare changes to a part category",
       description: "Prepare renaming, reparenting, or changing defaults for a part category, with descendant impact shown.",
       inputSchema: {
+        ...planInputFields,
         category_id: z.number().int().positive(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
@@ -819,8 +977,9 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
     },
-    async ({ category_id, changes }, extra) =>
+    async (input, extra) =>
       safely(oauth, async () => {
+        const { category_id, changes } = input;
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
         const category = await getCategory(client, category_id);
         if (changes.parent_id === category_id) throw new Error("A category cannot be its own parent");
@@ -889,11 +1048,12 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
         const checkPaths: Array<[string, Record<string, unknown>?]> = [[`/api/part/category/${category_id}/`, { path_detail: true }]];
         if (newParent) checkPaths.push([`/api/part/category/${changes.parent_id}/`, { path_detail: true }]);
         if (siblingCheck) checkPaths.push(["/api/part/category/", siblingCheck]);
-        return planResult(savePlan(oauth, auth, summary, [{ method: "PATCH", path: `/api/part/category/${category_id}/`, body }], await checksFor(client, checkPaths)));
+        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: `/api/part/category/${category_id}/`, body }], await checksFor(client, checkPaths));
       }),
   );
 
   const locationFields = {
+    ...planInputFields,
     name: z.string().min(1).max(100),
     parent_id: z.number().int().positive().nullable().optional(),
     description: z.string().max(250).default(""),
@@ -924,10 +1084,15 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
           throw new Error(`A location named ${input.name} already exists under the selected parent`);
         }
         const path = [parent ? stringValue(parent.pathstring) : "", input.name].filter(Boolean).join("/");
-        const summary = `Create stock location ${displayPath(path)}\n- Structural: ${input.structural ? "yes" : "no"}`;
+        const summary = [
+          `Create stock location ${displayPath(path)}`,
+          `- Structural: ${input.structural ? "yes" : "no"}`,
+          ...(input.description ? [`- Description: ${input.description}`] : []),
+          ...(input.tags.length ? [`- Tags: ${input.tags.join(", ")}`] : []),
+        ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [["/api/stock/location/", siblingsQuery]];
         if (parent) checkPaths.push([`/api/stock/location/${input.parent_id}/`, { path_detail: true }]);
-        return planResult(savePlan(oauth, auth, summary, [{ method: "POST", path: "/api/stock/location/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, tags: input.tags } }], await checksFor(client, checkPaths)));
+        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/stock/location/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, tags: input.tags } }], await checksFor(client, checkPaths), [{ name: "stock_location", entityType: "stock_location", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path) }]);
       }),
   );
 
@@ -937,6 +1102,7 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       title: "Prepare changes to a stock location",
       description: "Prepare renaming, reparenting, or changing a physical stock location, with descendant and item impact shown.",
       inputSchema: {
+        ...planInputFields,
         location_id: z.number().int().positive(),
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
@@ -949,8 +1115,9 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
     },
-    async ({ location_id, changes }, extra) =>
+    async (input, extra) =>
       safely(oauth, async () => {
+        const { location_id, changes } = input;
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
         const location = await getLocation(client, location_id);
         if (changes.parent_id === location_id) throw new Error("A location cannot be its own parent");
@@ -1017,7 +1184,7 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
         const checkPaths: Array<[string, Record<string, unknown>?]> = [[`/api/stock/location/${location_id}/`, { path_detail: true }]];
         if (newParent) checkPaths.push([`/api/stock/location/${changes.parent_id}/`, { path_detail: true }]);
         if (siblingCheck) checkPaths.push(["/api/stock/location/", siblingCheck]);
-        return planResult(savePlan(oauth, auth, summary, [{ method: "PATCH", path: `/api/stock/location/${location_id}/`, body }], await checksFor(client, checkPaths)));
+        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: `/api/stock/location/${location_id}/`, body }], await checksFor(client, checkPaths));
       }),
   );
 }
@@ -1029,8 +1196,9 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
       title: "Prepare printing inventory labels",
       description: "Resolve an enabled label template by ID, name, or dimensions and prepare a real printer side effect.",
       inputSchema: {
+        ...planInputFields,
         entity_type: z.enum(["part", "stock_item", "stock_location"]),
-        entity_ids: z.array(z.number().int().positive()).min(1).max(100),
+        entities: z.array(entitySelectorSchema).min(1).max(100),
         template: z.string().min(1).describe("Template ID like #20, exact name, or dimensions like 30x15mm"),
         printer: z.string().min(1).default("zebra").describe("InvenTree label printing plugin slug"),
         copies: z.number().int().min(1).max(20).default(1),
@@ -1064,27 +1232,48 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
           stock_item: (id: number) => `/api/stock/${id}/`,
           stock_location: (id: number) => `/api/stock/location/${id}/`,
         } as const;
-        const entities = await Promise.all(input.entity_ids.map((id) => client.get(entityPaths[input.entity_type](id))));
-        const labels = entities.map((value, index) => {
-          const item = record(value);
-          return optionalString(item.pathstring) ? displayPath(stringValue(item.pathstring)) : optionalString(item.name) ?? optionalString(item.full_name) ?? `${input.entity_type} #${input.entity_ids[index]}`;
-        });
+        const expectedType = input.entity_type;
+        const reviewed = input.plan_id ? reviewPlan(oauth, auth, input.plan_id).plan : undefined;
+        const resolved = await Promise.all(input.entities.map(async (selector) => {
+          if ("ref" in selector) {
+            if (!reviewed) throw new Error("plan_id is required when an entity selector uses ref");
+            const output = reviewed.steps.flatMap((step) => step.outputs).find((candidate) => candidate.ref === selector.ref);
+            if (!output) throw new Error(`Unknown plan reference: ${selector.ref}`);
+            if (output.entityType !== expectedType) {
+              throw new Error(`Plan reference ${selector.ref} is ${output.entityType}, not ${expectedType}`);
+            }
+            return { item: { __planRef: selector.ref }, label: output.display, suffix: `ref ${selector.ref}` };
+          }
+          const query = input.entity_type === "stock_item"
+            ? { part_detail: true, location_detail: true, path_detail: true }
+            : { path_detail: true };
+          const value = record(await client.get(entityPaths[input.entity_type](selector.id), query));
+          let label = optionalString(value.pathstring)
+            ? displayPath(stringValue(value.pathstring))
+            : optionalString(value.name) ?? optionalString(value.full_name);
+          if (input.entity_type === "stock_item") {
+            label = `${formatRef(stockPartRef(value))} in ${formatRef(stockLocationRef(value))}`;
+          }
+          return { item: selector.id, label: label ?? `${input.entity_type} #${selector.id}`, suffix: `#${selector.id}` };
+        }));
         const summary = [
-          `Print ${input.copies} cop${input.copies === 1 ? "y" : "ies"} of ${input.entity_ids.length} ${input.entity_type.replaceAll("_", " ")} label${input.entity_ids.length === 1 ? "" : "s"}:`,
-          ...labels.map((label, index) => `- ${label} (#${input.entity_ids[index]})`),
+          `Print ${input.copies} cop${input.copies === 1 ? "y" : "ies"} of ${resolved.length} ${input.entity_type.replaceAll("_", " ")} label${resolved.length === 1 ? "" : "s"}:`,
+          ...resolved.map(({ label, suffix }) => `- ${label} (${suffix})`),
           `- Template: ${stringValue(template.name)} (#${numberValue(template.pk)}, ${template.width}x${template.height}mm)`,
           `- Printer plugin: ${input.printer}`,
         ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
           ["/api/label/template/", query],
-          ...input.entity_ids.map((id) => [entityPaths[input.entity_type](id), undefined] as [string, undefined]),
+          ...input.entities.flatMap((selector) => "id" in selector
+            ? [[entityPaths[input.entity_type](selector.id), input.entity_type === "stock_item" ? { part_detail: true, location_detail: true, path_detail: true } : { path_detail: true }] as [string, Record<string, unknown>]]
+            : []),
         ];
         const requests: MutationRequest[] = Array.from({ length: input.copies }, () => ({
           method: "POST" as const,
           path: "/api/label/print/",
-          body: { template: numberValue(template.pk), plugin: input.printer, items: input.entity_ids },
+          body: { template: numberValue(template.pk), plugin: input.printer, items: resolved.map(({ item }) => item) },
         }));
-        return planResult(savePlan(oauth, auth, summary, requests, await checksFor(client, checkPaths)));
+        return stageMutation(oauth, auth, input, summary, requests, await checksFor(client, checkPaths));
       }),
   );
 }

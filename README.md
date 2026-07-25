@@ -34,7 +34,7 @@ Read tools return compact Markdown plus minimal normalized structured data. Cate
 | `scan_barcode` | Resolve a barcode without changing inventory |
 | `inventree_get` | Advanced raw read-only `/api/` escape hatch |
 
-Dedicated write tools validate exact IDs and prepare a short-lived immutable plan. They do not mutate InvenTree immediately. After showing the returned preview and obtaining user confirmation, call `commit_inventory_change(plan_id)`. Commit re-reads relevant upstream state, rejects stale plans, and consumes each plan exactly once.
+Dedicated write tools append stable steps to a short-lived shared plan. Staging and plan editing do not mutate InvenTree and do not require user confirmation. Review the complete plan once, obtain confirmation, then call `commit_inventory_plan(plan_id, expected_version)`. Commit re-reads relevant upstream state, executes the frozen plan serially, and retains its result for safe retries.
 
 | Write tool | Purpose |
 | --- | --- |
@@ -48,13 +48,15 @@ Dedicated write tools validate exact IDs and prepare a short-lived immutable pla
 | `create_part_category` / `update_part_category` | Organize the part hierarchy |
 | `create_stock_location` / `update_stock_location` | Organize the physical hierarchy |
 | `print_labels` | Resolve a template and prepare a printer side effect |
-| `commit_inventory_change` | Revalidate and commit a confirmed plan |
+| `review_inventory_plan` | Show the consolidated plan with immutable step IDs and output refs |
+| `remove_inventory_plan_step` | Remove a step, rejecting dependents unless cascade is explicit |
+| `discard_inventory_plan` | Discard temporary plan state without changing InvenTree |
+| `commit_inventory_plan` | Revalidate and commit the once-confirmed plan |
 | `inventree_write` | Optional advanced raw POST/PATCH/PUT escape hatch; no DELETE |
 
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
-Live-test findings and the proposed shared-plan / future-entity-reference design are in [`docs/MCP_LIVE_ERGONOMICS_REVIEW.md`](docs/MCP_LIVE_ERGONOMICS_REVIEW.md).
 
 ## Deploy with Docker Compose
 

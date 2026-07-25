@@ -59,14 +59,47 @@ export interface MutationCheck {
   digest: string;
 }
 
-export interface MutationPlan {
+export type InventoryEntityType = "part" | "stock_item" | "part_category" | "stock_location";
+
+export interface MutationOutput {
+  ref: string;
+  name: string;
+  entityType: InventoryEntityType;
+  requestIndex: number;
+  responsePaths: Array<Array<string | number>>;
+  display: string;
+}
+
+export interface MutationStep {
   id: string;
-  credentialsId: string;
+  operationId: string;
   summary: string;
   requests: MutationRequest[];
   checks: MutationCheck[];
+  outputs: MutationOutput[];
   createdAt: number;
+}
+
+export interface MutationCommitResult {
+  status: "committed" | "failed";
+  completedSteps: number;
+  completedRequests: number;
+  resolvedRefs: Record<string, number | string>;
+  resultIds: number[];
+  failedStepId?: string;
+  error?: string;
+}
+
+export interface MutationPlan {
+  id: string;
+  credentialsId: string;
+  version: number;
+  state: "staging" | "committing" | "committed" | "failed";
+  steps: MutationStep[];
+  createdAt: number;
+  updatedAt: number;
   expiresAt: number;
+  commitResult?: MutationCommitResult;
 }
 
 export interface StoreData {
@@ -101,6 +134,12 @@ export class JsonStore {
     try {
       this.data = JSON.parse(readFileSync(file, "utf8")) as StoreData;
       this.data.mutationPlans ??= {};
+      // Mutation plans are intentionally short-lived and are not user data.
+      // Drop plans from the pre-v0.3 isolated-plan representation rather than
+      // attempting to execute them with different semantics.
+      for (const [id, plan] of Object.entries(this.data.mutationPlans)) {
+        if (!Array.isArray((plan as MutationPlan).steps)) delete this.data.mutationPlans[id];
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.data = emptyStore();

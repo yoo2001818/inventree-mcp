@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   decodeCursor,
   encodeCursor,
+  formatLocationInventory,
   formatPartSearch,
   formatTree,
   normalizePart,
@@ -44,9 +45,27 @@ describe("AI-facing inventory formatting", () => {
     const text = formatPartSearch(page({ count: 1 }, [summary], 0));
 
     assert.match(text, /10 kOhm resistor, 1%, 0603 \(#203\) — 200 pcs total/);
+    assert.match(text, /^Results 1-1 of 1 part:/);
     assert.match(text, /Electronics > Resistors \(#15\)/);
     assert.match(text, /Living room > Drawer A3 \(#81\): 200 pcs \[stock #991\]/);
     assert.doesNotMatch(text, /pricing|purchase|assembly/);
+  });
+
+  it("labels location pagination as a stock-item range and page-local part count", () => {
+    const text = formatLocationInventory(
+      { id: 81, name: "Drawer A3" },
+      [
+        { stockItemId: 991, location: { id: 81, name: "Drawer A3" }, quantity: 2 },
+        { stockItemId: 992, location: { id: 81, name: "Drawer A3" }, quantity: 3 },
+      ],
+      new Map([
+        [991, { id: 203, name: "10k resistor" }],
+        [992, { id: 203, name: "10k resistor" }],
+      ]),
+      { count: 15, offset: 10 },
+    );
+
+    assert.match(text, /Showing stock items 11-12 of 15 \(1 part on this page\)\./);
   });
 
   it("uses opaque, validated pagination cursors", () => {

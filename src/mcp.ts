@@ -10,7 +10,7 @@ export function createMcpServer(oauth: OAuthService): McpServer {
     { name: "inventree-mcp", version: "0.2.0" },
     {
       instructions:
-        "This connector is optimized for home parts and physical stock management. Use the compact domain tools before raw API requests. Resolve exact part, stock-item, category, and location IDs with read tools before preparing a mutation. Mutation tools only prepare short-lived plans; show the exact preview to the user and call commit_inventory_change only after the user confirms it. Never invent IDs or treat receive, consume, count, and move as interchangeable quantity operations. Manufacturing, purchasing, and sales are outside the default workflow profile.",
+        "This connector is optimized for home parts and physical stock management. Use compact domain tools before raw API requests. Resolve exact existing IDs with read tools, and copy server-issued refs for entities that earlier plan steps will create. Mutation tools append non-destructive steps to one shared plan without asking for confirmation. Call review_inventory_plan, show its complete preview, ask the user once, then call commit_inventory_plan with the reviewed plan ID and version. Never invent IDs or refs, and never treat receive, consume, count, and move as interchangeable quantity operations. Manufacturing, purchasing, and sales are outside the default workflow profile.",
     },
   );
 

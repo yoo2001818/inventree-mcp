@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document proposes an MCP tool surface for using InvenTree as a personal parts and stock inventory. It focuses on the things a person is likely to say in conversation:
+This document defines the MCP tool surface for using InvenTree as a personal parts and stock inventory. It focuses on the things a person is likely to say in conversation:
 
 - "Where are my 10 kOhm resistors?"
 - "I bought 200 of these; put them in drawer A3."
@@ -95,7 +95,7 @@ A generic `adjust_stock(delta)` makes sign errors too easy.
 
 ### Make reads cheap and writes deliberate
 
-Read tools should be easy to compose. Writes should use a preview followed by a confirmed commit so the user sees the exact records, quantities, and destinations involved.
+Read tools should be easy to compose. Writes first stage non-destructive steps in temporary bridge state. The assistant then shows one consolidated review, asks once for confirmation, and commits the complete plan.
 
 ## Core read tools
 
@@ -109,13 +109,14 @@ Suggested input:
 {
   "root_id": 13,
   "search": "capacitor",
-  "max_depth": 4,
+  "max_level": 4,
+  "full_tree": false,
   "include_counts": false,
   "include_descriptions": false
 }
 ```
 
-All fields are optional. Without `root_id`, return top-level trees. A search result should include matched branches with enough ancestors to preserve context. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for optional counts or details.
+All fields are optional. Without `root_id`, `search`, or `full_tree: true`, return only top-level nodes with child/item counts. A search result should include matched branches with enough ancestors to preserve context. `max_level` deliberately mirrors InvenTree's zero-based level semantics; it is not a relative depth count. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for top-level orientation, counts, or details.
 
 Canonical output:
 
@@ -138,7 +139,8 @@ Suggested input mirrors `browse_part_categories`:
 {
   "root_id": 4,
   "search": "drawer A3",
-  "max_depth": 5,
+  "max_level": 5,
+  "full_tree": false,
   "include_item_counts": true,
   "include_descriptions": false
 }
@@ -176,7 +178,7 @@ Suggested input:
 Canonical output:
 
 ```markdown
-Found 2 parts:
+Results 1-2 of 2 parts:
 
 1. 10 kOhm resistor, 1%, 0603 (#203) — 247 pcs total
    Category: Electronics > Passive Components > Resistors (#15)
@@ -185,7 +187,6 @@ Found 2 parts:
 2. 10 kOhm resistor, 5%, THT (#77) — out of stock
    Category: Electronics > Passive Components > Resistors (#15)
 
-Showing 2 of 2.
 ```
 
 Search output should include the fields used for disambiguation: name, ID, description only if useful, IPN if present, category path, total quantity with units, and stock placements. Batch, serial, packaging, status, or expiry should appear only when present and differentiating.
@@ -247,7 +248,7 @@ Canonical output:
 - 10 kOhm resistor, 1%, 0603 (#203): 200 pcs [stock #991]
 - 100 nF ceramic capacitor, X7R, 0603 (#244): 85 pcs [stock #1102]
 
-2 stock items, 2 parts.
+Showing stock items 1-2 of 2 (2 parts on this page).
 ```
 
 When `include_sublocations` is true, preserve location subheadings rather than flattening the physical hierarchy.
@@ -274,6 +275,8 @@ Canonical output:
 - 100 nF ceramic capacitor (#244): 12 pcs; minimum 50; short by 38
 - JST-XH 2-pin housing (#351): 0 pcs; minimum 20; short by 20
 ```
+
+For `state: "depleted"`, use `out of stock` rather than shortage language. A depleted part whose configured minimum is zero is still out of stock but is not "short by 0".
 
 ### `get_stock_history`
 
@@ -437,6 +440,7 @@ Suggested input:
 ```
 
 Preview output must show recorded value, observed value, and delta for every item.
+Unchanged lines are omitted. If every observed quantity is already current, return `already_current` and do not create or modify a plan.
 
 ### `set_stock_status`
 
@@ -476,10 +480,11 @@ Suggested input:
 
 ```json
 {
+  "operation_id": "print-stock-991",
   "entity_type": "stock_item",
-  "entity_ids": [991],
+  "entities": [{ "id": 991 }],
   "template": "30x15mm",
-  "printer": "default",
+  "printer": "zebra",
   "copies": 1
 }
 ```
@@ -490,8 +495,6 @@ Printing is a real-world side effect. Always preview the entity names/paths, pri
 
 ## Mutation safety protocol
 
-> Revised after live testing: the original one-operation-per-plan protocol was insufficient for composed workflows. The canonical follow-up design and observed issues are recorded in [`MCP_LIVE_ERGONOMICS_REVIEW.md`](MCP_LIVE_ERGONOMICS_REVIEW.md).
-
 Mutation tools stage steps in one shared plan. Staging changes only temporary bridge state, is non-destructive, and must not ask the user for confirmation. If `plan_id` is omitted, the first staging call creates a plan; later calls append to it.
 
 Each staged create operation declares outputs and returns opaque plan-scoped references. Later steps can use those references before InvenTree has assigned numeric IDs. For example, a print step can refer to the stock item that an earlier create step will produce.
@@ -500,11 +503,135 @@ Future references are local to the `plan_id` supplied on each staging call, so t
 
 `review_inventory_plan` returns the complete canonical preview. Only then does the assistant ask the user for confirmation.
 
-After confirmation, `commit_inventory_plan(plan_id, expected_version)` freezes and revalidates the plan, executes steps in dependency order, resolves future references from earlier results, and returns the final ID mapping.
+After confirmation, `commit_inventory_plan(plan_id, expected_version)` freezes and revalidates the plan, executes steps serially, resolves future references from earlier results, and returns the final ID mapping.
 
 Only the commit tool is destructive. Staging and plan-editing tools use `destructiveHint: false`; the commit tool uses `destructiveHint: true`. Append operations use idempotency keys and plan versions to prevent duplicate or lost updates.
 
 Several InvenTree requests committed from one plan are orchestrated as one reviewed action but are not an upstream database transaction. Partial completion must be reported precisely; automatic rollback must not be assumed.
+
+### Stable plan identity
+
+A plan has three distinct kinds of identity:
+
+- `position` is the current human-facing order. It can change when a step is removed.
+- `step_id` is an immutable opaque step identity such as `stp_B7Q2K9`. It is never renumbered or reused.
+- `ref` is an immutable opaque identity for one declared output, such as `stock_R4M8XP`. It remains stable for the plan's lifetime.
+
+Never use a display ordinal such as `step-1` as an identity. If the first step is removed, the remaining steps may be displayed as 1 and 2 again without changing either step's `step_id` or outputs.
+
+References are plan-local. Because every consuming call already includes `plan_id`, the reference itself does not repeat that plan ID. The server internally resolves `(plan_id, ref)` and rejects unknown, invalidated, cross-plan, wrong-type, or not-yet-available references. Entity selectors use a structured union:
+
+```ts
+type EntitySelector =
+  | { id: number }
+  | { ref: string };
+```
+
+The object form removes the need for a magic `#ref#` string prefix and prevents confusion between a numeric ID and a numeric-looking string. Entity-type prefixes help diagnostics, but refs are server-issued opaque values: clients copy them and never construct them.
+
+### Staging contract
+
+Every staging tool accepts these plan-control fields alongside its workflow fields:
+
+```json
+{
+  "plan_id": "optional-existing-plan",
+  "expected_version": 1,
+  "operation_id": "caller-stable-idempotency-key"
+}
+```
+
+- Omit `plan_id` to create a plan implicitly.
+- Supply `plan_id` and the latest `expected_version` to append serially.
+- Reusing `operation_id` for the same operation returns its existing step rather than appending a duplicate.
+- Reusing an operation ID for different content is an error.
+- A successful append increments `plan_version` and refreshes idle expiry.
+
+The response is informational, not a confirmation request:
+
+```json
+{
+  "status": "staged",
+  "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
+  "plan_version": 2,
+  "step_id": "stp_B7Q2K9",
+  "position": 2,
+  "outputs": [
+    {
+      "name": "stock_item",
+      "entity_type": "stock_item",
+      "ref": "stock_R4M8XP",
+      "display": "10 kOhm resistor in Drawer A3"
+    }
+  ]
+}
+```
+
+Every workflow summary must expose all material non-default fields that will be written, including descriptions, keywords, metadata, packaging, expiry, notes, status, print template, printer, copy count, and the number/order of upstream operations. Long values may be visibly truncated only if the complete value remains bound to the frozen plan.
+
+### Referencing an entity created earlier in the plan
+
+For example, `create_part_with_stock` can return a future stock ref. A later label step uses it without knowing the eventual InvenTree ID:
+
+```json
+{
+  "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
+  "expected_version": 1,
+  "operation_id": "print-new-stock-label",
+  "entity_type": "stock_item",
+  "entities": [{ "ref": "stock_R4M8XP" }],
+  "template": "30x15mm",
+  "printer": "zebra",
+  "copies": 1
+}
+```
+
+Plans execute in their displayed serial order, so a ref may only consume an output from an earlier step. At commit, the connector extracts the real ID from the producer response and substitutes it into later request bodies.
+
+### Review and plan editing
+
+`review_inventory_plan(plan_id)` is the canonical, consolidated preview. It includes current position, immutable step ID, every material field and side effect, declared outputs, and upstream operation order. This is the first point at which the assistant asks the user to confirm.
+
+Plan management is non-destructive:
+
+- `remove_inventory_plan_step(plan_id, step_id, expected_version, cascade=false)` removes an independent step.
+- If another step consumes the target's outputs, removal is rejected and lists immutable dependent step IDs.
+- `cascade: true` explicitly removes the producer and all transitive dependents.
+- `discard_inventory_plan(plan_id)` deletes only temporary connector state.
+- Removed step and ref IDs are never reused.
+
+### Commit and retry behavior
+
+`commit_inventory_plan(plan_id, expected_version)` is the only destructive plan tool and the only call that should prompt for confirmation. It freezes the plan before its first await, revalidates all captured existing-entity state, executes requests serially, resolves outputs, and records a bounded result:
+
+```json
+{
+  "status": "committed",
+  "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
+  "completed_steps": 3,
+  "resolved_refs": {
+    "part_N2C6VW": 1301,
+    "stock_R4M8XP": 944
+  }
+}
+```
+
+Replaying a successfully committed plan returns the recorded result without repeating writes. A partial failure records completed step/request counts, resolved refs, the immutable failed step ID, and the upstream error. It must not claim transactionality or attempt an unsafe automatic rollback.
+
+Plans are scoped to the authenticated credential link, expire after an idle period, and cannot accept steps after commit begins. Committed and failed results remain briefly available for retry and diagnosis.
+
+### Live-output correctness requirements
+
+The following constraints came from exercising the tools against a real home inventory and are part of the permanent command contract:
+
+- Known stock-history deltas are normalized into quantity, location, status, count, add, remove, or transfer text. Nested upstream serializers are never dumped; unknown primitive deltas use a bounded fallback.
+- A paged location result says `Showing stock items 11-15 of 15 (5 parts on this page)`. A page's unique-part count is not represented as the whole location total.
+- A depleted result says `out of stock`; below-minimum results use current/minimum/shortage wording.
+- No-op stock counts return `already_current` without staging a step.
+- Existing stock-item label previews resolve both the part and physical location. Planned stock labels show their planned identity and that the ID is assigned at commit.
+- A partial move discloses that InvenTree will split the source and assign another stock-item ID. The current transfer response schema does not expose that new ID, so the tool must not issue an unsafe ref for it; a later read resolves the resulting placement.
+- Unfiltered category/location browsing starts at top-level nodes. Full trees require `full_tree: true` or branch expansion with `root_id`.
+- Paged part search uses an absolute range such as `Results 6-10 of 17`.
 
 ## Error and ambiguity contracts
 
@@ -524,7 +651,7 @@ Expected domain failures should not dump a serializer or stack trace. Authentica
 
 - Prefer opaque cursors at the MCP boundary even if InvenTree uses numeric offsets internally.
 - Default search result limits to 10 or 20, not 100.
-- Include `Showing N of M` and a next cursor when truncated.
+- Include an absolute range such as `Results 6-10 of 17` and a next cursor when truncated.
 - Put a hard node limit on trees. If exceeded, return top levels and tell the model which `root_id` values can be expanded.
 - Never embed upstream `next` URLs; they leak deployment details and are not useful to the model.
 - Sort trees in stable path/name order and histories newest first.
@@ -568,7 +695,7 @@ One MCP call should normally answer this question.
 2. Stage location creates/renames in one plan.
 3. Append stock moves using server-issued references for planned destination locations.
 4. Append label printing for the final planned locations.
-5. Review the complete dependency-ordered plan and ask once for confirmation.
+5. Review the complete serial plan and ask once for confirmation.
 6. Commit the plan, while preserving a clear report boundary between structure changes, stock movement, and printing.
 
 ## Recommended tool set and priority
@@ -667,5 +794,5 @@ The optimized connector is successful when:
 - The model never needs to know an InvenTree API path for a normal home-inventory task.
 - Add, remove, count, and move cannot be confused by quantity semantics.
 - Every mutation preview identifies exact records and before/after quantities or paths.
-- User confirmation is bound to a short-lived immutable plan.
+- User confirmation is requested once and bound to the reviewed version of a short-lived shared plan.
 - Full raw API access is exceptional, visibly advanced, and read-only by default.

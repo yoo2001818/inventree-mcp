@@ -46,6 +46,34 @@ function resultPage<T>(source: unknown, values: T[], offset: number) {
   return page(source, values, offset);
 }
 
+function formatHistoryDelta(value: unknown): string {
+  const deltas = record(value);
+  const location = entityRef(deltas.location_detail);
+  if (location) return `moved to ${formatRef(location)}`;
+  const primitive = (key: string): string | undefined => {
+    const candidate = deltas[key];
+    return typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean"
+      ? String(candidate)
+      : undefined;
+  };
+  const changes = [
+    primitive("quantity") ? `quantity ${primitive("quantity")}` : "",
+    primitive("location") ? `location #${primitive("location")}` : "",
+    primitive("status") ? `status ${primitive("status")}` : "",
+    primitive("count") ? `count ${primitive("count")}` : "",
+    primitive("added") ? `added ${primitive("added")}` : "",
+    primitive("removed") ? `removed ${primitive("removed")}` : "",
+  ].filter(Boolean);
+  if (changes.length) return changes.join(", ");
+  const bounded = Object.fromEntries(
+    Object.entries(deltas)
+      .filter(([, child]) => child === null || ["string", "number", "boolean"].includes(typeof child))
+      .slice(0, 8),
+  );
+  const fallback = JSON.stringify(bounded);
+  return fallback === "{}" ? "" : fallback.slice(0, 300);
+}
+
 export function registerReadTools(server: McpServer, oauth: OAuthService): void {
   server.registerTool(
     "browse_part_categories",
@@ -56,7 +84,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
       inputSchema: {
         root_id: z.number().int().positive().optional().describe("Optional category whose descendants should be shown"),
         search: z.string().min(1).optional(),
-        max_depth: z.number().int().min(0).max(12).default(6),
+        max_level: z.number().int().min(0).max(12).default(6).describe("Upstream zero-based maximum tree level"),
+        full_tree: z.boolean().default(false),
         include_counts: z.boolean().default(false),
         include_descriptions: z.boolean().default(false),
       },
@@ -66,22 +95,24 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
     async (input, extra) =>
       safely(oauth, async () => {
         const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
-        const path = input.include_counts ? "/api/part/category/" : "/api/part/category/tree/";
+        const topLevelOnly = !input.root_id && !input.search && !input.full_tree;
+        const path = input.include_counts || topLevelOnly ? "/api/part/category/" : "/api/part/category/tree/";
         const data = await client.get(path, {
           parent: input.root_id,
+          top_level: topLevelOnly ? true : undefined,
           cascade: input.root_id && input.include_counts ? true : undefined,
           search: input.search,
-          max_level: input.include_counts ? undefined : input.max_depth,
+          max_level: input.include_counts || topLevelOnly ? undefined : input.max_level,
           limit: 250,
           offset: 0,
-          ordering: input.include_counts ? "pathstring" : "name",
+          ordering: input.include_counts || topLevelOnly ? "pathstring" : "name",
         });
         const nodes = pageResults(data);
         const count = numberValue(record(data).count, nodes.length);
         let text = formatTree(nodes, {
           kind: "category",
           search: input.search,
-          includeCounts: input.include_counts,
+          includeCounts: input.include_counts || topLevelOnly,
           includeDescriptions: input.include_descriptions,
         });
         if (count > nodes.length) {
@@ -113,7 +144,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
       inputSchema: {
         root_id: z.number().int().positive().optional().describe("Optional location whose descendants should be shown"),
         search: z.string().min(1).optional(),
-        max_depth: z.number().int().min(0).max(12).default(6),
+        max_level: z.number().int().min(0).max(12).default(6).describe("Upstream zero-based maximum tree level"),
+        full_tree: z.boolean().default(false),
         include_item_counts: z.boolean().default(false),
         include_descriptions: z.boolean().default(false),
       },
@@ -123,22 +155,24 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
     async (input, extra) =>
       safely(oauth, async () => {
         const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
-        const path = input.include_item_counts ? "/api/stock/location/" : "/api/stock/location/tree/";
+        const topLevelOnly = !input.root_id && !input.search && !input.full_tree;
+        const path = input.include_item_counts || topLevelOnly ? "/api/stock/location/" : "/api/stock/location/tree/";
         const data = await client.get(path, {
           parent: input.root_id,
+          top_level: topLevelOnly ? true : undefined,
           cascade: input.root_id && input.include_item_counts ? true : undefined,
           search: input.search,
-          max_level: input.include_item_counts ? undefined : input.max_depth,
+          max_level: input.include_item_counts || topLevelOnly ? undefined : input.max_level,
           limit: 250,
           offset: 0,
-          ordering: input.include_item_counts ? "pathstring" : "name",
+          ordering: input.include_item_counts || topLevelOnly ? "pathstring" : "name",
         });
         const nodes = pageResults(data);
         const count = numberValue(record(data).count, nodes.length);
         let text = formatTree(nodes, {
           kind: "location",
           search: input.search,
-          includeCounts: input.include_item_counts,
+          includeCounts: input.include_item_counts || topLevelOnly,
           includeDescriptions: input.include_descriptions,
         });
         if (count > nodes.length) {
@@ -293,7 +327,7 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
         const output = resultPage(stockData, placements, offset);
         return result(
           { location, ...output, parts: Object.fromEntries(partByStock) },
-          formatLocationInventory(location, placements, partByStock) +
+          formatLocationInventory(location, placements, partByStock, output) +
             (output.nextCursor ? `\nNext cursor: ${output.nextCursor}` : ""),
         );
       }),
@@ -335,6 +369,7 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
           ? summaries.map((part) => {
               const minimum = part.minimumStock ?? 0;
               const shortage = Math.max(0, minimum - part.totalQuantity);
+              if (input.state === "depleted") return `- ${part.name} (#${part.id}): out of stock`;
               return `- ${part.name} (#${part.id}): ${formatQuantity(part.totalQuantity, part.units)}; ` +
                 `minimum ${formatQuantity(minimum, part.units)}; short by ${formatQuantity(shortage, part.units)}`;
             })
@@ -386,7 +421,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
         const output = resultPage(data, items, offset);
         const lines = items.length
           ? items.map((item) => {
-              const delta = item.deltas === undefined ? "" : ` — ${JSON.stringify(item.deltas)}`;
+              const formatted = formatHistoryDelta(item.deltas);
+              const delta = formatted ? ` — ${formatted}` : "";
               return `- ${item.date}: ${item.label || "Stock change"}${delta}${item.notes ? ` — ${item.notes}` : ""} [event #${item.id}]`;
             })
           : ["No matching stock history found."];

@@ -2,6 +2,7 @@ export type JsonRecord = Record<string, unknown>;
 
 export interface Page<T> {
   count: number;
+  offset: number;
   results: T[];
   nextCursor?: string;
 }
@@ -91,6 +92,7 @@ export function page<T>(data: unknown, items: T[], offset: number): Page<T> {
   const consumed = offset + items.length;
   return {
     count,
+    offset,
     results: items,
     ...(consumed < count ? { nextCursor: encodeCursor(consumed) } : {}),
   };
@@ -197,7 +199,9 @@ function differentiators(placement: StockPlacement): string {
 
 export function formatPartSearch(resultPage: Page<PartSummary>): string {
   if (resultPage.results.length === 0) return "No matching parts found.";
-  const lines = [`Found ${resultPage.count} part${resultPage.count === 1 ? "" : "s"}:`, ""];
+  const first = resultPage.offset + 1;
+  const last = resultPage.offset + resultPage.results.length;
+  const lines = [`Results ${first}-${last} of ${resultPage.count} part${resultPage.count === 1 ? "" : "s"}:`, ""];
   resultPage.results.forEach((part, index) => {
     lines.push(
       `${index + 1}. ${part.name} (#${part.id}) — ${
@@ -219,7 +223,6 @@ export function formatPartSearch(resultPage: Page<PartSummary>): string {
     if (part.ipn) lines.push(`   IPN: ${part.ipn}`);
     if (part.description) lines.push(`   Description: ${part.description}`);
   });
-  lines.push("", `Showing ${resultPage.results.length} of ${resultPage.count}.`);
   if (resultPage.nextCursor) lines.push(`Next cursor: ${resultPage.nextCursor}`);
   return lines.join("\n");
 }
@@ -309,7 +312,12 @@ export function formatTree(
     .join("\n");
 }
 
-export function formatLocationInventory(location: EntityRef, placements: StockPlacement[], parts: Map<number, EntityRef>): string {
+export function formatLocationInventory(
+  location: EntityRef,
+  placements: StockPlacement[],
+  parts: Map<number, EntityRef>,
+  page?: { count: number; offset: number },
+): string {
   const lines = [`## ${formatRef(location)}`, ""];
   if (placements.length === 0) lines.push("- No stock items.");
   for (const placement of placements) {
@@ -321,10 +329,9 @@ export function formatLocationInventory(location: EntityRef, placements: StockPl
     );
   }
   const uniqueParts = new Set([...parts.values()].map((part) => part.id)).size;
-  lines.push(
-    "",
-    `${placements.length} stock item${placements.length === 1 ? "" : "s"}, ` +
-      `${uniqueParts} part${uniqueParts === 1 ? "" : "s"}.`,
-  );
+  const range = page && placements.length
+    ? `Showing stock items ${page.offset + 1}-${page.offset + placements.length} of ${page.count}`
+    : `${placements.length} stock item${placements.length === 1 ? "" : "s"}`;
+  lines.push("", `${range} (${uniqueParts} part${uniqueParts === 1 ? "" : "s"} on this page).`);
   return lines.join("\n");
 }
