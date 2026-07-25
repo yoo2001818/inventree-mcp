@@ -49,9 +49,11 @@ export interface StoredRefreshToken extends Omit<StoredAccessToken, "tokenHash">
 
 export interface MutationRequest {
   method: "POST" | "PATCH" | "PUT";
-  path: string;
+  path: string | MutationPathSegment[];
   body: unknown;
 }
+
+export type MutationPathSegment = string | { __planRef: string };
 
 export interface MutationCheck {
   path: string;
@@ -68,6 +70,7 @@ export interface MutationOutput {
   requestIndex: number;
   responsePaths: Array<Array<string | number>>;
   display: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface MutationStep {

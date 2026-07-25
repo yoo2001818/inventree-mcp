@@ -52,6 +52,7 @@ export interface PlannedOutputInput {
   requestIndex: number;
   responsePaths: Array<Array<string | number>>;
   display: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface StagePlanInput {
@@ -139,19 +140,21 @@ export function stagePlan(
 export function stageResult(staged: { plan: MutationPlan; step: MutationStep; duplicate: boolean }) {
   const { plan, step, duplicate } = staged;
   const outputText = step.outputs.length
-    ? `\n${step.outputs.map((output) => `- Future ${output.entityType.replaceAll("_", " ")}: ${output.display} ({\"ref\":\"${output.ref}\"})`).join("\n")}`
+    ? `\n${step.outputs.map((output) => `- Future ${output.entityType.replaceAll("_", " ")}: ${output.display} (ref ${output.ref})`).join("\n")}`
     : "";
   return {
     structuredContent: {
-      status: "staged",
-      plan_id: plan.id,
-      plan_version: plan.version,
-      step_id: step.id,
-      position: plan.steps.findIndex((candidate) => candidate.id === step.id) + 1,
-      duplicate_operation: duplicate,
-      expires_at: new Date(plan.expiresAt).toISOString(),
-      summary: step.summary,
-      outputs: step.outputs.map(({ ref, name, entityType, display }) => ({ ref, name, entity_type: entityType, display })),
+      data: {
+        status: "staged",
+        plan_id: plan.id,
+        plan_version: plan.version,
+        step_id: step.id,
+        position: plan.steps.findIndex((candidate) => candidate.id === step.id) + 1,
+        duplicate_operation: duplicate,
+        expires_at: new Date(plan.expiresAt).toISOString(),
+        summary: step.summary,
+        outputs: step.outputs.map(({ ref, name, entityType, display }) => ({ ref, name, entity_type: entityType, display })),
+      },
     },
     content: [
       {
@@ -174,9 +177,22 @@ function referencedPlanRefs(value: unknown, refs = new Set<string>()): Set<strin
 
 function validateReferences(plan: MutationPlan, step: MutationStep): void {
   const available = new Set(plan.steps.flatMap((candidate) => candidate.outputs.map((output) => output.ref)));
-  for (const ref of step.requests.flatMap((request) => [...referencedPlanRefs(request.body)])) {
+  for (const ref of step.requests.flatMap((request) => [
+    ...referencedPlanRefs(request.path),
+    ...referencedPlanRefs(request.body),
+  ])) {
     if (!available.has(ref)) throw new Error(`Unknown or not-yet-available plan reference: ${ref}`);
   }
+}
+
+function resolveRequestPath(path: MutationRequest["path"], refs: Map<string, number | string>): string {
+  if (typeof path === "string") return path;
+  return path.map((segment) => {
+    if (typeof segment === "string") return segment;
+    const resolved = refs.get(segment.__planRef);
+    if (resolved === undefined) throw new Error(`Plan reference was not resolved: ${segment.__planRef}`);
+    return encodeURIComponent(String(resolved));
+  }).join("");
 }
 
 function resolveReferences(value: unknown, results: unknown[], refs: Map<string, number | string>): unknown {
@@ -235,9 +251,9 @@ export function reviewPlan(oauth: OAuthService, authInfo: AuthInfo, planId: stri
     text: [
       `Inventory plan ${plan.id}, version ${plan.version} (${plan.state})`,
       ...plan.steps.flatMap((step, index) => [
-        `\n${index + 1}. ${step.summary} [${step.id}]`,
-        ...step.outputs.map((output) => `   Output: ${output.display} ({"ref":"${output.ref}"})`),
-        `   Upstream operations: ${step.requests.length}`,
+        `\n${index + 1}. [${step.id}]`,
+        step.summary,
+        ...step.outputs.map((output) => `   Output: ${output.display} (ref ${output.ref})`),
       ]),
       `\nTotal upstream operations: ${plan.steps.reduce((count, step) => count + step.requests.length, 0)}`,
     ].join("\n"),
@@ -347,7 +363,7 @@ export async function commitPlan(
       const request = step.requests[requestIndex]!;
       const body = resolveReferences(request.body, stepResults, refs);
       try {
-        const response = await client.write(request.method, request.path, body);
+        const response = await client.write(request.method, resolveRequestPath(request.path, refs), body);
         stepResults.push(response);
         completedRequests += 1;
         const directId = extractPath(response, ["pk"]);

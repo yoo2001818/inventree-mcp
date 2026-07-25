@@ -301,7 +301,8 @@ export function formatTree(
       if (node.structural === true) markers.push("structural");
       const countField = options.kind === "category" ? "part_count" : "items";
       if (options.includeCounts && node[countField] !== undefined && node[countField] !== null) {
-        markers.push(`${numberValue(node[countField])} ${options.kind === "category" ? "parts" : "stock items"}`);
+        const count = numberValue(node[countField]);
+        markers.push(`${count} ${options.kind === "category" ? `part${count === 1 ? "" : "s"}` : `stock item${count === 1 ? "" : "s"}`}`);
       }
       const description = options.includeDescriptions ? optionalString(node.description) : undefined;
       const suffix = [markers.length ? `[${markers.join("; ")}]` : "", description ? `— ${description}` : ""]

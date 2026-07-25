@@ -116,7 +116,7 @@ Suggested input:
 }
 ```
 
-All fields are optional. Without `root_id`, `search`, or `full_tree: true`, return only top-level nodes with child/item counts. A search result should include matched branches with enough ancestors to preserve context. `max_level` deliberately mirrors InvenTree's zero-based level semantics; it is not a relative depth count. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for top-level orientation, counts, or details.
+All fields are optional. Without `root_id`, `search`, or `full_tree: true`, return only top-level nodes with child/item counts. A search result should include matched branches with enough ancestors to preserve context. `max_level` deliberately mirrors InvenTree's zero-based level semantics; it is not a relative depth count. The connector must enforce this bound after fetching, including when counts require an InvenTree list endpoint that ignores `max_level`. Use `/api/part/category/tree/` where possible, with `/api/part/category/` for top-level orientation, counts, or details.
 
 Canonical output:
 
@@ -482,7 +482,7 @@ Suggested input:
 {
   "operation_id": "print-stock-991",
   "entity_type": "stock_item",
-  "entities": [{ "id": 991 }],
+  "entities": [991],
   "template": "30x15mm",
   "printer": "zebra",
   "copies": 1
@@ -519,15 +519,15 @@ A plan has three distinct kinds of identity:
 
 Never use a display ordinal such as `step-1` as an identity. If the first step is removed, the remaining steps may be displayed as 1 and 2 again without changing either step's `step_id` or outputs.
 
-References are plan-local. Because every consuming call already includes `plan_id`, the reference itself does not repeat that plan ID. The server internally resolves `(plan_id, ref)` and rejects unknown, invalidated, cross-plan, wrong-type, or not-yet-available references. Entity selectors use a structured union:
+References are plan-local. Because every consuming call already includes `plan_id`, the reference itself does not repeat that plan ID. The server internally resolves `(plan_id, ref)` and rejects unknown, invalidated, cross-plan, wrong-type, or not-yet-available references. Every entity-ID field on a mutation tool accepts this scalar union:
 
 ```ts
-type EntitySelector =
-  | { id: number }
-  | { ref: string };
+type EntityId = number | string;
 ```
 
-The object form removes the need for a magic `#ref#` string prefix and prevents confusion between a numeric ID and a numeric-looking string. Entity-type prefixes help diagnostics, but refs are server-issued opaque values: clients copy them and never construct them.
+Numbers and decimal strings such as `91` and `"91"` identify existing InvenTree entities; the connector normalizes and validates them as positive safe integers. Any other string is treated as an opaque server-issued plan ref. Refs use typed, nonnumeric prefixes, so they cannot collide with an existing numeric ID. Clients copy refs exactly and never construct them. The legacy `{ "id": 91 }` and `{ "ref": "stock_R4M8XP" }` forms remain accepted by `print_labels`, but scalars are canonical.
+
+Ref substitution applies to both request bodies and entity IDs embedded in request paths, so a planned entity can be updated by a later step before its numeric ID exists. A workflow that must search InvenTree cannot search a future entity; in that case the caller supplies a more explicit earlier output ref, such as `stock_item_id`, or selects a non-searching mode such as `merge: "new_item"`.
 
 ### Staging contract
 
@@ -547,23 +547,25 @@ Every staging tool accepts these plan-control fields alongside its workflow fiel
 - Reusing an operation ID for different content is an error.
 - A successful append increments `plan_version` and refreshes idle expiry.
 
-The response is informational, not a confirmation request:
+The response is informational, not a confirmation request. MCP structured responses use one consistent `{ data: ... }` envelope:
 
 ```json
 {
-  "status": "staged",
-  "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
-  "plan_version": 2,
-  "step_id": "stp_B7Q2K9",
-  "position": 2,
-  "outputs": [
-    {
-      "name": "stock_item",
-      "entity_type": "stock_item",
-      "ref": "stock_R4M8XP",
-      "display": "10 kOhm resistor in Drawer A3"
-    }
-  ]
+  "data": {
+    "status": "staged",
+    "plan_id": "XkkpE8NFka1sL7ey9PWbaBvO",
+    "plan_version": 2,
+    "step_id": "stp_B7Q2K9",
+    "position": 2,
+    "outputs": [
+      {
+        "name": "stock_item",
+        "entity_type": "stock_item",
+        "ref": "stock_R4M8XP",
+        "display": "10 kOhm resistor in Drawer A3"
+      }
+    ]
+  }
 }
 ```
 
@@ -579,7 +581,7 @@ For example, `create_part_with_stock` can return a future stock ref. A later lab
   "expected_version": 1,
   "operation_id": "print-new-stock-label",
   "entity_type": "stock_item",
-  "entities": [{ "ref": "stock_R4M8XP" }],
+  "entities": ["stock_R4M8XP"],
   "template": "30x15mm",
   "printer": "zebra",
   "copies": 1
@@ -632,6 +634,51 @@ The following constraints came from exercising the tools against a real home inv
 - A partial move discloses that InvenTree will split the source and assign another stock-item ID. The current transfer response schema does not expose that new ID, so the tool must not issue an unsafe ref for it; a later read resolves the resulting placement.
 - Unfiltered category/location browsing starts at top-level nodes. Full trees require `full_tree: true` or branch expansion with `root_id`.
 - Paged part search uses an absolute range such as `Results 6-10 of 17`.
+
+### Agent exploration findings: 2026-07-25
+
+After restarting Codex and the development server, the connector was exercised through its published MCP tools as an agent rather than through unit-test fixtures. The exploration covered:
+
+- top-level and branch category/location browsing;
+- first and subsequent part-search pages;
+- depleted stock, part inventory, inventory-at-location, and stock history;
+- `create_part_with_stock` followed by `print_labels` using the planned stock-item ref;
+- consolidated plan review;
+- duplicate `operation_id` replay and stale-version rejection;
+- dependent-step rejection, successful removal, and re-append with a new immutable step ID;
+- an already-current stock count;
+- existing-stock label and partial-move previews.
+
+No plan was committed. All temporary probe plans were discarded, and a final exact-name search returned no probe part.
+
+#### Confirmed behavior
+
+- Initial category and location calls are compact top-level orientations.
+- Part search includes useful disambiguation, stock IDs, quantities, and physical paths in one result.
+- Subsequent search pages use absolute ranges such as `Results 6-10 of 15`.
+- Location pages distinguish total stock items from page-local unique parts.
+- Depleted results say `out of stock` even when minimum stock is zero.
+- Human-readable stock history normalizes a location change without dumping the location serializer.
+- Mutation staging does not interrupt for user confirmation.
+- A create step returns typed part and stock refs; a later label step accepts the future stock ref.
+- Replaying identical content with the same `operation_id` returns the existing step without incrementing the plan version.
+- A unique append with a stale `expected_version` fails with both expected and current versions.
+- Removing a producer lists the immutable dependent step IDs; removing and re-adding a dependent creates a new step ID while preserving the producer's output ref.
+- An unchanged count returns `already_current` without creating a plan.
+- Partial movement explicitly warns that InvenTree will split the source stock item.
+
+#### Findings addressed in the implementation
+
+1. **Future refs are general mutation entity IDs.** All mutation fields that identify parts, stock items, categories, or locations accept numbers, numeric strings, or typed plan refs. The connector resolves refs in both request bodies and paths.
+2. **Counted branch browsing enforces `max_level`.** Category and location results are filtered in the connector when the count-capable upstream endpoint ignores the bound, and the response discloses how many deeper nodes were omitted.
+3. **Stock-history structured deltas are normalized.** Known changes return bounded semantic fields; full nested upstream serializers are excluded.
+4. **Plan-review identity is unambiguous.** Each immutable `step_id` has its own heading, and the total upstream-operation count is shown once.
+5. **Default tree text and structured counts agree.** Top-level structured nodes include the counts shown in text.
+6. **Existing stock labels identify the stock item explicitly.** Previews render `[stock #674]` rather than an unlabeled final number.
+7. **Singular grammar is normalized.** Part, stock-item, step, and stock-count summaries distinguish one from many.
+8. **Structured response envelopes are uniform.** Staging, read, and plan-management payloads all place their fields under `structuredContent.data`.
+9. **Global connector guidance is compact.** The server publishes the workflow rule once without prefixing a long paragraph to every tool description.
+10. **Location inventory placements are self-contained.** Each placement includes its compact part identity directly rather than requiring a separate stock-ID join map.
 
 ## Error and ambiguity contracts
 

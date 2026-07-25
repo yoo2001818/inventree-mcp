@@ -46,10 +46,10 @@ function resultPage<T>(source: unknown, values: T[], offset: number) {
   return page(source, values, offset);
 }
 
-function formatHistoryDelta(value: unknown): string {
+function normalizeHistoryDelta(value: unknown) {
   const deltas = record(value);
   const location = entityRef(deltas.location_detail);
-  if (location) return `moved to ${formatRef(location)}`;
+  if (location) return { kind: "location", text: `moved to ${formatRef(location)}`, location };
   const primitive = (key: string): string | undefined => {
     const candidate = deltas[key];
     return typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean"
@@ -64,14 +64,19 @@ function formatHistoryDelta(value: unknown): string {
     primitive("added") ? `added ${primitive("added")}` : "",
     primitive("removed") ? `removed ${primitive("removed")}` : "",
   ].filter(Boolean);
-  if (changes.length) return changes.join(", ");
-  const bounded = Object.fromEntries(
+  if (changes.length) return { kind: "fields", text: changes.join(", "), fields: boundedPrimitiveDeltas(deltas) };
+  const bounded = boundedPrimitiveDeltas(deltas);
+  const fallback = JSON.stringify(bounded);
+  return { kind: "unknown", text: fallback === "{}" ? "" : fallback.slice(0, 300), fields: bounded };
+}
+
+function boundedPrimitiveDeltas(deltas: Record<string, unknown>): Record<string, string | number | boolean | null> {
+  return Object.fromEntries(
     Object.entries(deltas)
-      .filter(([, child]) => child === null || ["string", "number", "boolean"].includes(typeof child))
+      .filter((entry): entry is [string, string | number | boolean | null] =>
+        entry[1] === null || ["string", "number", "boolean"].includes(typeof entry[1]))
       .slice(0, 8),
   );
-  const fallback = JSON.stringify(bounded);
-  return fallback === "{}" ? "" : fallback.slice(0, 300);
 }
 
 export function registerReadTools(server: McpServer, oauth: OAuthService): void {
@@ -107,16 +112,22 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
           offset: 0,
           ordering: input.include_counts || topLevelOnly ? "pathstring" : "name",
         });
-        const nodes = pageResults(data);
-        const count = numberValue(record(data).count, nodes.length);
+        const rawNodes = pageResults(data);
+        const nodes = !topLevelOnly
+          ? rawNodes.filter((node) => numberValue(node.level) <= input.max_level)
+          : rawNodes;
+        const availableCount = numberValue(record(data).count, rawNodes.length);
+        const count = nodes.length;
         let text = formatTree(nodes, {
           kind: "category",
           search: input.search,
           includeCounts: input.include_counts || topLevelOnly,
           includeDescriptions: input.include_descriptions,
         });
-        if (count > nodes.length) {
-          text += `\n\nTree truncated: showing ${nodes.length} of ${count} nodes. Call again with a root_id to expand one branch.`;
+        if (availableCount > nodes.length) {
+          text += !topLevelOnly
+            ? `\n\nDepth limited: showing ${nodes.length} of ${availableCount} matching nodes through max_level ${input.max_level}.`
+            : `\n\nTree truncated: showing ${nodes.length} of ${availableCount} nodes. Call again with a root_id to expand one branch.`;
         }
         return result(
           {
@@ -127,7 +138,7 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
               path: displayPath(stringValue(node.pathstring)),
               parentId: node.parent ?? null,
               structural: node.structural === true,
-              ...(input.include_counts && node.part_count !== undefined ? { partCount: node.part_count } : {}),
+              ...((input.include_counts || topLevelOnly) && node.part_count !== undefined ? { partCount: node.part_count } : {}),
             })),
           },
           text,
@@ -167,16 +178,22 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
           offset: 0,
           ordering: input.include_item_counts || topLevelOnly ? "pathstring" : "name",
         });
-        const nodes = pageResults(data);
-        const count = numberValue(record(data).count, nodes.length);
+        const rawNodes = pageResults(data);
+        const nodes = !topLevelOnly
+          ? rawNodes.filter((node) => numberValue(node.level) <= input.max_level)
+          : rawNodes;
+        const availableCount = numberValue(record(data).count, rawNodes.length);
+        const count = nodes.length;
         let text = formatTree(nodes, {
           kind: "location",
           search: input.search,
           includeCounts: input.include_item_counts || topLevelOnly,
           includeDescriptions: input.include_descriptions,
         });
-        if (count > nodes.length) {
-          text += `\n\nTree truncated: showing ${nodes.length} of ${count} nodes. Call again with a root_id to expand one branch.`;
+        if (availableCount > nodes.length) {
+          text += !topLevelOnly
+            ? `\n\nDepth limited: showing ${nodes.length} of ${availableCount} matching nodes through max_level ${input.max_level}.`
+            : `\n\nTree truncated: showing ${nodes.length} of ${availableCount} nodes. Call again with a root_id to expand one branch.`;
         }
         return result(
           {
@@ -187,7 +204,7 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
               path: displayPath(stringValue(node.pathstring)),
               parentId: node.parent ?? null,
               structural: node.structural === true,
-              ...(input.include_item_counts && node.items !== undefined ? { stockItemCount: node.items } : {}),
+              ...((input.include_item_counts || topLevelOnly) && node.items !== undefined ? { stockItemCount: node.items } : {}),
             })),
           },
           text,
@@ -324,9 +341,13 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
           const part = entityRef(stock.part_detail);
           if (part) partByStock.set(numberValue(stock.pk), part);
         });
-        const output = resultPage(stockData, placements, offset);
+        const enrichedPlacements = placements.map((placement) => ({
+          ...placement,
+          ...(partByStock.get(placement.stockItemId) ? { part: partByStock.get(placement.stockItemId) } : {}),
+        }));
+        const output = resultPage(stockData, enrichedPlacements, offset);
         return result(
-          { location, ...output, parts: Object.fromEntries(partByStock) },
+          { location, ...output },
           formatLocationInventory(location, placements, partByStock, output) +
             (output.nextCursor ? `\nNext cursor: ${output.nextCursor}` : ""),
         );
@@ -415,14 +436,13 @@ export function registerReadTools(server: McpServer, oauth: OAuthService): void 
           stockItemId: item.item,
           partId: item.part,
           label: stringValue(item.label),
-          deltas: item.deltas,
+          delta: normalizeHistoryDelta(item.deltas),
           notes: optionalString(item.notes),
         }));
         const output = resultPage(data, items, offset);
         const lines = items.length
           ? items.map((item) => {
-              const formatted = formatHistoryDelta(item.deltas);
-              const delta = formatted ? ` — ${formatted}` : "";
+              const delta = item.delta.text ? ` — ${item.delta.text}` : "";
               return `- ${item.date}: ${item.label || "Stock change"}${delta}${item.notes ? ` — ${item.notes}` : ""} [event #${item.id}]`;
             })
           : ["No matching stock history found."];

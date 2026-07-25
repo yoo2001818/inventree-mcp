@@ -27,20 +27,28 @@ import {
 import type { OAuthService } from "./oauth.js";
 import { clientFor, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import type { MutationCheck, MutationRequest } from "./store.js";
+import type { InventoryEntityType, MutationOutput } from "./store.js";
 
 const positiveQuantity = z.number().positive().finite();
 const optionalText = z.string().max(50_000).nullable().optional();
+const entityIdSchema = z.union([
+  z.number().int().positive(),
+  z.string().min(1).describe("Existing numeric ID or a server-issued ref from an earlier plan step"),
+]);
+const nullableEntityIdSchema = entityIdSchema.nullable();
 const planInputFields = {
   plan_id: z.string().min(16).optional().describe("Existing shared plan to append to; omit to start a new plan"),
   expected_version: z.number().int().positive().optional().describe("Required with plan_id to prevent lost updates"),
   operation_id: z.string().min(1).max(100).describe("Caller-stable idempotency key for this staged step"),
 };
 const entitySelectorSchema = z.union([
+  entityIdSchema,
   z.object({ id: z.number().int().positive() }).strict(),
   z.object({ ref: z.string().min(1) }).strict(),
 ]);
 
 type PlanInput = { plan_id?: string; expected_version?: number; operation_id: string };
+type EntityId = number | string;
 
 const STATUS_CODES = {
   ok: 10,
@@ -143,6 +151,74 @@ function stageMutation(
   }));
 }
 
+function normalizeEntityId(value: EntityId): EntityId {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`Invalid entity ID: ${value}`);
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("Entity ID or plan reference cannot be blank");
+  if (!/^\d+$/.test(trimmed)) return trimmed;
+  const numeric = Number(trimmed);
+  if (!Number.isSafeInteger(numeric) || numeric <= 0) throw new Error(`Invalid entity ID: ${value}`);
+  return numeric;
+}
+
+function selectorId(value: EntityId | { id: number } | { ref: string }): EntityId {
+  if (typeof value === "number" || typeof value === "string") return normalizeEntityId(value);
+  return normalizeEntityId("id" in value ? value.id : value.ref);
+}
+
+function plannedOutput(
+  oauth: OAuthService,
+  auth: Parameters<typeof reviewPlan>[1],
+  planId: string | undefined,
+  value: EntityId,
+  expectedType: InventoryEntityType,
+): MutationOutput | undefined {
+  const normalized = normalizeEntityId(value);
+  if (typeof normalized === "number") return undefined;
+  if (!planId) throw new Error(`plan_id is required when using planned ref ${normalized}`);
+  const output = reviewPlan(oauth, auth, planId).plan.steps
+    .flatMap((step) => step.outputs)
+    .find((candidate) => candidate.ref === normalized);
+  if (!output) throw new Error(`Unknown plan reference: ${normalized}`);
+  if (output.entityType !== expectedType) {
+    throw new Error(`Plan reference ${normalized} is ${output.entityType}, not ${expectedType}`);
+  }
+  return output;
+}
+
+function mutationValue(value: EntityId | null): unknown {
+  if (value === null) return null;
+  const normalized = normalizeEntityId(value);
+  return typeof normalized === "number" ? normalized : { __planRef: normalized };
+}
+
+function mutationPath(prefix: string, value: EntityId, suffix = "/"): MutationRequest["path"] {
+  const normalized = normalizeEntityId(value);
+  return typeof normalized === "number"
+    ? `${prefix}${normalized}${suffix}`
+    : [prefix, { __planRef: normalized }, suffix];
+}
+
+function plannedLabel(output: MutationOutput | undefined, fallback: string): string {
+  return output ? `${output.display} (ref ${output.ref})` : fallback;
+}
+
+function metadataBoolean(output: MutationOutput | undefined, key: string): boolean | undefined {
+  const value = output?.metadata?.[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function pathSegments(path: string): string[] {
+  return path
+    .split("/")
+    .flatMap((segment) => segment.split(/\s+>\s+/))
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
 export function registerWriteTools(server: McpServer, oauth: OAuthService): void {
   server.registerTool(
     "create_part_with_stock",
@@ -155,13 +231,13 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         part: z.object({
           name: z.string().min(1).max(100),
           description: z.string().max(250).default(""),
-          category_id: z.number().int().positive(),
+          category_id: entityIdSchema,
           IPN: z.string().max(100).default(""),
           keywords: z.array(z.string().min(1)).default([]),
           units: z.string().max(20).nullable().optional(),
           minimum_stock: z.number().nonnegative().default(0),
           maximum_stock: z.number().nonnegative().default(0),
-          default_location_id: z.number().int().positive().nullable().optional(),
+          default_location_id: nullableEntityIdSchema.optional(),
           trackable: z.boolean().default(false),
           link: z.string().url().max(2000).nullable().optional(),
           notes: optionalText,
@@ -169,7 +245,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         initial_stock: z
           .object({
             quantity: positiveQuantity,
-            location_id: z.number().int().positive(),
+            location_id: entityIdSchema,
             batch: z.string().max(100).nullable().optional(),
             packaging: z.string().max(50).nullable().optional(),
             expiry_date: z.string().date().nullable().optional(),
@@ -185,16 +261,29 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     async (input, extra) =>
       safely(oauth, async () => {
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const category = await getCategory(client, input.part.category_id);
-        ensurePartCategory(category);
-        const defaultLocation = input.part.default_location_id
-          ? await getLocation(client, input.part.default_location_id)
+        const categoryId = normalizeEntityId(input.part.category_id);
+        const categoryOutput = plannedOutput(oauth, auth, input.plan_id, categoryId, "part_category");
+        const category = typeof categoryId === "number" ? await getCategory(client, categoryId) : undefined;
+        if (category) ensurePartCategory(category);
+        if (metadataBoolean(categoryOutput, "structural")) throw new Error(`${categoryOutput!.display} is structural and cannot directly contain parts`);
+        const defaultLocationId = input.part.default_location_id === null || input.part.default_location_id === undefined
+          ? input.part.default_location_id
+          : normalizeEntityId(input.part.default_location_id);
+        const defaultLocationOutput = defaultLocationId === null || defaultLocationId === undefined
+          ? undefined
+          : plannedOutput(oauth, auth, input.plan_id, defaultLocationId, "stock_location");
+        const defaultLocation = typeof defaultLocationId === "number"
+          ? await getLocation(client, defaultLocationId)
           : undefined;
         if (defaultLocation) ensureStockDestination(defaultLocation);
-        const stockLocation = input.initial_stock
-          ? await getLocation(client, input.initial_stock.location_id)
-          : undefined;
+        if (metadataBoolean(defaultLocationOutput, "structural")) throw new Error(`${defaultLocationOutput!.display} is structural and cannot directly contain stock`);
+        const stockLocationId = input.initial_stock ? normalizeEntityId(input.initial_stock.location_id) : undefined;
+        const stockLocationOutput = stockLocationId === undefined
+          ? undefined
+          : plannedOutput(oauth, auth, input.plan_id, stockLocationId, "stock_location");
+        const stockLocation = typeof stockLocationId === "number" ? await getLocation(client, stockLocationId) : undefined;
         if (stockLocation) ensureStockDestination(stockLocation);
+        if (metadataBoolean(stockLocationOutput, "structural")) throw new Error(`${stockLocationOutput!.display} is structural and cannot directly contain stock`);
 
         const duplicateQuery = { search: input.part.name, active: true, limit: 10, offset: 0 };
         const duplicates = await client.get("/api/part/", duplicateQuery);
@@ -210,7 +299,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         const partBody: Record<string, unknown> = {
           name: input.part.name,
           description: input.part.description,
-          category: input.part.category_id,
+          category: mutationValue(categoryId),
           IPN: input.part.IPN,
           keywords: input.part.keywords.join(", "),
           minimum_stock: input.part.minimum_stock,
@@ -223,8 +312,8 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           virtual: false,
           trackable: input.part.trackable,
           ...(input.part.units !== undefined ? { units: input.part.units } : {}),
-          ...(input.part.default_location_id !== undefined
-            ? { default_location: input.part.default_location_id }
+          ...(defaultLocationId !== undefined
+            ? { default_location: mutationValue(defaultLocationId) }
             : {}),
           ...(input.part.link !== undefined ? { link: input.part.link } : {}),
           ...(input.part.notes !== undefined ? { notes: input.part.notes } : {}),
@@ -237,7 +326,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
             body: {
               part: { __result: 0, __field: "pk" },
               quantity: input.initial_stock.quantity,
-              location: input.initial_stock.location_id,
+              location: mutationValue(stockLocationId!),
               ...(input.initial_stock.batch ? { batch: input.initial_stock.batch } : {}),
               ...(input.initial_stock.packaging ? { packaging: input.initial_stock.packaging } : {}),
               ...(input.initial_stock.expiry_date ? { expiry_date: input.initial_stock.expiry_date } : {}),
@@ -245,19 +334,19 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
             },
           });
         }
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [
-          [`/api/part/category/${input.part.category_id}/`, { path_detail: true }],
-          ["/api/part/", duplicateQuery],
-        ];
-        if (input.part.default_location_id) {
-          checkPaths.push([`/api/stock/location/${input.part.default_location_id}/`, { path_detail: true }]);
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [["/api/part/", duplicateQuery]];
+        if (typeof categoryId === "number") {
+          checkPaths.unshift([`/api/part/category/${categoryId}/`, { path_detail: true }]);
         }
-        if (input.initial_stock && input.initial_stock.location_id !== input.part.default_location_id) {
-          checkPaths.push([`/api/stock/location/${input.initial_stock.location_id}/`, { path_detail: true }]);
+        if (typeof defaultLocationId === "number") {
+          checkPaths.push([`/api/stock/location/${defaultLocationId}/`, { path_detail: true }]);
+        }
+        if (typeof stockLocationId === "number" && stockLocationId !== defaultLocationId) {
+          checkPaths.push([`/api/stock/location/${stockLocationId}/`, { path_detail: true }]);
         }
         const summary = [
           `Create part ${input.part.name}`,
-          `- Category: ${formatRef(refOrFallback(category, "Category", input.part.category_id))}`,
+          `- Category: ${plannedLabel(categoryOutput, formatRef(refOrFallback(category, "Category", Number(categoryId))))}`,
           ...(input.part.description ? [`- Description: ${input.part.description}`] : []),
           ...(input.part.IPN ? [`- IPN: ${input.part.IPN}`] : []),
           ...(input.part.keywords.length ? [`- Keywords: ${input.part.keywords.join(", ")}`] : []),
@@ -265,13 +354,16 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ...(input.part.minimum_stock ? [`- Minimum stock: ${input.part.minimum_stock}`] : []),
           ...(input.part.maximum_stock ? [`- Maximum stock: ${input.part.maximum_stock}`] : []),
           ...(input.part.trackable ? ["- Trackable: yes"] : []),
-          ...(defaultLocation ? [`- Default location: ${formatRef(refOrFallback(defaultLocation, "Location", input.part.default_location_id!))}`] : []),
+          ...(defaultLocationId !== undefined && defaultLocationId !== null
+            ? [`- Default location: ${plannedLabel(defaultLocationOutput, formatRef(refOrFallback(defaultLocation, "Location", Number(defaultLocationId))))}`]
+            : []),
           ...(input.part.link ? [`- Link: ${input.part.link}`] : []),
           ...(input.part.notes ? [`- Part notes: ${input.part.notes}`] : []),
-          ...(input.initial_stock && stockLocation
+          ...(input.initial_stock
             ? [
-                `- Initial stock: ${formatQuantity(input.initial_stock.quantity, input.part.units ?? undefined)} in ${formatRef(
-                  refOrFallback(stockLocation, "Location", input.initial_stock.location_id),
+                `- Initial stock: ${formatQuantity(input.initial_stock.quantity, input.part.units ?? undefined)} in ${plannedLabel(
+                  stockLocationOutput,
+                  formatRef(refOrFallback(stockLocation, "Location", Number(stockLocationId))),
                 )}`,
                 ...(input.initial_stock.batch ? [`- Stock batch: ${input.initial_stock.batch}`] : []),
                 ...(input.initial_stock.packaging ? [`- Stock packaging: ${input.initial_stock.packaging}`] : []),
@@ -282,14 +374,26 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           `- Upstream operations: ${requests.length}`,
         ].join("\n");
         const outputs: PlannedOutputInput[] = [
-          { name: "part", entityType: "part", requestIndex: 0, responsePaths: [["pk"]], display: input.part.name },
+          {
+            name: "part",
+            entityType: "part",
+            requestIndex: 0,
+            responsePaths: [["pk"]],
+            display: input.part.name,
+            metadata: { name: input.part.name, units: input.part.units ?? null, locked: false },
+          },
           ...(input.initial_stock
             ? [{
                 name: "stock_item" as const,
                 entityType: "stock_item" as const,
                 requestIndex: 1,
                 responsePaths: [[0, "pk"], ["pk"]],
-                display: `${input.part.name} in ${formatRef(refOrFallback(stockLocation!, "Location", input.initial_stock.location_id))}`,
+                display: `${input.part.name} in ${plannedLabel(stockLocationOutput, formatRef(refOrFallback(stockLocation, "Location", Number(stockLocationId))))}`,
+                metadata: {
+                  part_name: input.part.name,
+                  location: plannedLabel(stockLocationOutput, formatRef(refOrFallback(stockLocation, "Location", Number(stockLocationId)))),
+                  quantity: input.initial_stock.quantity,
+                },
               }]
             : []),
         ];
@@ -304,17 +408,17 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare a sparse metadata update for an existing part and show an exact before/after diff.",
       inputSchema: {
         ...planInputFields,
-        part_id: z.number().int().positive(),
+        part_id: entityIdSchema,
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
           description: z.string().max(250).optional(),
-          category_id: z.number().int().positive().nullable().optional(),
+          category_id: nullableEntityIdSchema.optional(),
           IPN: z.string().max(100).optional(),
           keywords: z.array(z.string().min(1)).optional(),
           units: z.string().max(20).nullable().optional(),
           minimum_stock: z.number().nonnegative().optional(),
           maximum_stock: z.number().nonnegative().optional(),
-          default_location_id: z.number().int().positive().nullable().optional(),
+          default_location_id: nullableEntityIdSchema.optional(),
           default_expiry: z.number().int().nonnegative().optional(),
           link: z.string().url().max(2000).nullable().optional(),
           notes: optionalText,
@@ -328,19 +432,39 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     },
     async (input, extra) =>
       safely(oauth, async () => {
-        const { part_id, changes } = input;
+        const { changes } = input;
+        const part_id = normalizeEntityId(input.part_id);
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const part = await getPart(client, part_id);
-        ensureUnlocked(part);
+        const partOutput = plannedOutput(oauth, auth, input.plan_id, part_id, "part");
+        const part = typeof part_id === "number" ? await getPart(client, part_id) : undefined;
+        if (part) ensureUnlocked(part);
         let category: JsonRecord | undefined;
-        if (changes.category_id) {
-          category = await getCategory(client, changes.category_id);
+        const categoryId = changes.category_id === null || changes.category_id === undefined
+          ? changes.category_id
+          : normalizeEntityId(changes.category_id);
+        const categoryOutput = categoryId === null || categoryId === undefined
+          ? undefined
+          : plannedOutput(oauth, auth, input.plan_id, categoryId, "part_category");
+        if (typeof categoryId === "number") {
+          category = await getCategory(client, categoryId);
           ensurePartCategory(category);
         }
+        if (metadataBoolean(categoryOutput, "structural")) {
+          throw new Error(`${categoryOutput!.display} is structural and cannot directly contain parts`);
+        }
         let location: JsonRecord | undefined;
-        if (changes.default_location_id) {
-          location = await getLocation(client, changes.default_location_id);
+        const locationId = changes.default_location_id === null || changes.default_location_id === undefined
+          ? changes.default_location_id
+          : normalizeEntityId(changes.default_location_id);
+        const locationOutput = locationId === null || locationId === undefined
+          ? undefined
+          : plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
+        if (typeof locationId === "number") {
+          location = await getLocation(client, locationId);
           ensureStockDestination(location);
+        }
+        if (metadataBoolean(locationOutput, "structural")) {
+          throw new Error(`${locationOutput!.display} is structural and cannot directly contain stock`);
         }
         const mapping: Array<[keyof typeof changes, string, string]> = [
           ["name", "name", "Name"],
@@ -363,29 +487,44 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         for (const [inputKey, upstreamKey, label] of mapping) {
           const value = changes[inputKey];
           if (value === undefined) continue;
-          body[upstreamKey] = value;
-          const diff = beforeAfter(label, part[upstreamKey], value);
+          const normalizedValue = inputKey === "category_id"
+            ? categoryId
+            : inputKey === "default_location_id"
+              ? locationId
+              : value;
+          body[upstreamKey] = inputKey === "category_id" || inputKey === "default_location_id"
+            ? mutationValue(normalizedValue as EntityId | null)
+            : normalizedValue;
+          const displayValue = categoryOutput && inputKey === "category_id"
+            ? categoryOutput.display
+            : locationOutput && inputKey === "default_location_id"
+              ? locationOutput.display
+              : normalizedValue;
+          const diff = part
+            ? beforeAfter(label, part[upstreamKey], displayValue)
+            : `- ${label}: assigned at commit -> ${JSON.stringify(displayValue)}`;
           if (diff) diffs.push(diff);
         }
         if (changes.keywords !== undefined) {
           body.keywords = changes.keywords.join(", ");
-          const diff = beforeAfter("Keywords", part.keywords, body.keywords);
+          const diff = part
+            ? beforeAfter("Keywords", part.keywords, body.keywords)
+            : `- Keywords: assigned at commit -> ${JSON.stringify(body.keywords)}`;
           if (diff) diffs.push(diff);
         }
         if (!Object.keys(body).length) throw new Error("At least one part change is required");
         if (!diffs.length) throw new Error("The requested part values are already current");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [
-          [`/api/part/${part_id}/`, { category_detail: true, location_detail: true }],
-        ];
-        if (category) checkPaths.push([`/api/part/category/${changes.category_id}/`, { path_detail: true }]);
-        if (location) checkPaths.push([`/api/stock/location/${changes.default_location_id}/`, { path_detail: true }]);
-        const summary = [`Update ${formatRef(partRef(part))}:`, ...diffs].join("\n");
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof part_id === "number") checkPaths.push([`/api/part/${part_id}/`, { category_detail: true, location_detail: true }]);
+        if (typeof categoryId === "number") checkPaths.push([`/api/part/category/${categoryId}/`, { path_detail: true }]);
+        if (typeof locationId === "number") checkPaths.push([`/api/stock/location/${locationId}/`, { path_detail: true }]);
+        const summary = [`Update ${plannedLabel(partOutput, formatRef(part ? partRef(part) : undefined))}:`, ...diffs].join("\n");
         return stageMutation(
           oauth,
           auth,
           input,
           summary,
-          [{ method: "PATCH", path: `/api/part/${part_id}/`, body }],
+          [{ method: "PATCH", path: mutationPath("/api/part/", part_id), body }],
           await checksFor(client, checkPaths),
         );
       }),
@@ -399,11 +538,11 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare adding newly acquired quantity to a compatible stock item or creating a new stock item. IDs are validated and the selected behavior is previewed.",
       inputSchema: {
         ...planInputFields,
-        part_id: z.number().int().positive(),
+        part_id: entityIdSchema,
         quantity: positiveQuantity,
-        location_id: z.number().int().positive(),
+        location_id: entityIdSchema,
         merge: z.enum(["compatible", "new_item", "stock_item"]).default("compatible"),
-        stock_item_id: z.number().int().positive().optional(),
+        stock_item_id: entityIdSchema.optional(),
         batch: z.string().max(100).nullable().optional(),
         packaging: z.string().max(50).nullable().optional(),
         expiry_date: z.string().date().nullable().optional(),
@@ -418,29 +557,44 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           throw new Error("stock_item_id is required when merge is stock_item");
         }
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+        const partId = normalizeEntityId(input.part_id);
+        const locationId = normalizeEntityId(input.location_id);
+        const partOutput = plannedOutput(oauth, auth, input.plan_id, partId, "part");
+        const locationOutput = plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
         const [part, location] = await Promise.all([
-          getPart(client, input.part_id),
-          getLocation(client, input.location_id),
+          typeof partId === "number" ? getPart(client, partId) : undefined,
+          typeof locationId === "number" ? getLocation(client, locationId) : undefined,
         ]);
-        ensureUnlocked(part);
-        ensureStockDestination(location);
+        if (part) ensureUnlocked(part);
+        if (location) ensureStockDestination(location);
+        if (metadataBoolean(locationOutput, "structural")) {
+          throw new Error(`${locationOutput!.display} is structural and cannot directly contain stock`);
+        }
+        if ((partOutput || locationOutput) && input.merge === "compatible") {
+          throw new Error("merge=compatible cannot search entities that do not exist yet; use merge=new_item or an explicit stock_item_id ref");
+        }
         let target: JsonRecord | undefined;
+        let targetOutput: MutationOutput | undefined;
         const query = {
-          part: input.part_id,
-          location: input.location_id,
+          part: partId,
+          location: locationId,
           in_stock: true,
           limit: 100,
           offset: 0,
           part_detail: false,
           location_detail: true,
         };
-        const listed = await client.get("/api/stock/", query);
+        const listed = typeof partId === "number" && typeof locationId === "number"
+          ? await client.get("/api/stock/", query)
+          : { results: [] };
         if (input.merge === "stock_item") {
-          target = await getStock(client, input.stock_item_id!);
-          if (numberValue(target.part) !== input.part_id || numberValue(target.location) !== input.location_id) {
+          const stockId = normalizeEntityId(input.stock_item_id!);
+          targetOutput = plannedOutput(oauth, auth, input.plan_id, stockId, "stock_item");
+          target = typeof stockId === "number" ? await getStock(client, stockId) : undefined;
+          if (target && (numberValue(target.part) !== partId || numberValue(target.location) !== locationId)) {
             throw new Error("The selected stock item does not match the requested part and location");
           }
-          if (numberValue(target.status, 10) !== 10 || target.expired === true) {
+          if (target && (numberValue(target.status, 10) !== 10 || target.expired === true)) {
             throw new Error("New stock cannot be merged into a non-OK or expired stock item");
           }
         } else if (input.merge === "compatible") {
@@ -459,13 +613,14 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           }
           target = compatible[0];
         }
-        const requests: MutationRequest[] = target
+        const targetId = input.stock_item_id === undefined ? undefined : normalizeEntityId(input.stock_item_id);
+        const requests: MutationRequest[] = target || targetOutput
           ? [
               {
                 method: "POST",
                 path: "/api/stock/add/",
                 body: {
-                  items: [{ pk: numberValue(target.pk), quantity: String(input.quantity) }],
+                  items: [{ pk: target ? numberValue(target.pk) : mutationValue(targetId!), quantity: String(input.quantity) }],
                   ...(input.notes ? { notes: input.notes } : {}),
                 },
               },
@@ -475,9 +630,9 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
                 method: "POST",
                 path: "/api/stock/",
                 body: {
-                  part: input.part_id,
+                  part: mutationValue(partId),
                   quantity: input.quantity,
-                  location: input.location_id,
+                  location: mutationValue(locationId),
                   ...(input.batch ? { batch: input.batch } : {}),
                   ...(input.packaging ? { packaging: input.packaging } : {}),
                   ...(input.expiry_date ? { expiry_date: input.expiry_date } : {}),
@@ -485,12 +640,16 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
                 },
               },
             ];
+        const partDisplay = plannedLabel(partOutput, formatRef(part ? partRef(part) : undefined));
+        const locationDisplay = plannedLabel(locationOutput, formatRef(refOrFallback(location, "Location", Number(locationId))));
+        const units = part ? optionalString(part.units) : optionalString(partOutput?.metadata?.units);
         const summary = target
-          ? `Receive ${formatQuantity(input.quantity, optionalString(part.units))} of ${formatRef(partRef(part))}\n` +
-            `- Add to stock #${numberValue(target.pk)} in ${formatRef(refOrFallback(location, "Location", input.location_id))}: ` +
-            `${formatQuantity(numberValue(target.quantity), optionalString(part.units))} -> ${formatQuantity(numberValue(target.quantity) + input.quantity, optionalString(part.units))}`
-          : `Receive ${formatQuantity(input.quantity, optionalString(part.units))} of ${formatRef(partRef(part))}\n` +
-            `- Create a new stock item in ${formatRef(refOrFallback(location, "Location", input.location_id))}`;
+          ? `Receive ${formatQuantity(input.quantity, units)} of ${partDisplay}\n` +
+            `- Add to stock #${numberValue(target.pk)} in ${locationDisplay}: ` +
+            `${formatQuantity(numberValue(target.quantity), units)} -> ${formatQuantity(numberValue(target.quantity) + input.quantity, units)}`
+          : targetOutput
+            ? `Receive ${formatQuantity(input.quantity, units)} of ${partDisplay}\n- Add to planned stock ${targetOutput.display} (ref ${targetOutput.ref})`
+            : `Receive ${formatQuantity(input.quantity, units)} of ${partDisplay}\n- Create a new stock item in ${locationDisplay}`;
         const detailedSummary = [
           summary,
           ...(input.batch ? [`- Batch: ${input.batch}`] : []),
@@ -498,20 +657,20 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ...(input.expiry_date ? [`- Expiry: ${input.expiry_date}`] : []),
           ...(input.notes ? [`- Notes: ${input.notes}`] : []),
         ].join("\n");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [
-          [`/api/part/${input.part_id}/`, { category_detail: true, location_detail: true }],
-          [`/api/stock/location/${input.location_id}/`, { path_detail: true }],
-          ["/api/stock/", query],
-        ];
-        if (input.stock_item_id) checkPaths.push([`/api/stock/${input.stock_item_id}/`, { part_detail: true, location_detail: true, path_detail: true }]);
-        const outputs: PlannedOutputInput[] | undefined = target
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof partId === "number") checkPaths.push([`/api/part/${partId}/`, { category_detail: true, location_detail: true }]);
+        if (typeof locationId === "number") checkPaths.push([`/api/stock/location/${locationId}/`, { path_detail: true }]);
+        if (typeof partId === "number" && typeof locationId === "number") checkPaths.push(["/api/stock/", query]);
+        if (typeof targetId === "number") checkPaths.push([`/api/stock/${targetId}/`, { part_detail: true, location_detail: true, path_detail: true }]);
+        const outputs: PlannedOutputInput[] | undefined = target || targetOutput
           ? undefined
           : [{
               name: "stock_item",
               entityType: "stock_item",
               requestIndex: 0,
               responsePaths: [[0, "pk"], ["pk"]],
-              display: `${formatRef(partRef(part))} in ${formatRef(refOrFallback(location, "Location", input.location_id))}`,
+              display: `${partDisplay} in ${locationDisplay}`,
+              metadata: { part_name: partDisplay, location: locationDisplay, quantity: input.quantity },
             }];
         return stageMutation(oauth, auth, input, detailedSummary, requests, await checksFor(client, checkPaths), outputs);
       }),
@@ -525,10 +684,10 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare removal of a used or discarded quantity from eligible stock. Returns an explicit per-stock-item allocation and never consumes unavailable stock.",
       inputSchema: {
         ...planInputFields,
-        part_id: z.number().int().positive(),
+        part_id: entityIdSchema,
         quantity: positiveQuantity,
-        location_id: z.number().int().positive().optional(),
-        stock_item_id: z.number().int().positive().optional(),
+        location_id: entityIdSchema.optional(),
+        stock_item_id: entityIdSchema.optional(),
         strategy: z.enum(["fewest_items", "oldest_first"]).optional(),
         reason: z.enum(["used", "discarded", "lost", "other"]).default("used"),
         notes: optionalText,
@@ -539,11 +698,39 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     async (input, extra) =>
       safely(oauth, async () => {
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const part = await getPart(client, input.part_id);
+        const partId = normalizeEntityId(input.part_id);
+        const locationId = input.location_id === undefined ? undefined : normalizeEntityId(input.location_id);
+        const stockId = input.stock_item_id === undefined ? undefined : normalizeEntityId(input.stock_item_id);
+        const partOutput = plannedOutput(oauth, auth, input.plan_id, partId, "part");
+        const locationOutput = locationId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
+        const stockOutput = stockId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, stockId, "stock_item");
+        const part = typeof partId === "number" ? await getPart(client, partId) : undefined;
+        const note = [input.reason, input.notes].filter(Boolean).join(": ");
+        if (stockOutput) {
+          const partDisplay = plannedLabel(partOutput, part ? formatRef(partRef(part)) : `Part ${String(partId)}`);
+          const summary = [
+            `Consume ${formatQuantity(input.quantity, part ? optionalString(part.units) : undefined)} of ${partDisplay}:`,
+            `- Planned stock ${stockOutput.display} (ref ${stockOutput.ref}): remove ${input.quantity}`,
+            ...(locationOutput ? [`- Expected location: ${locationOutput.display} (ref ${locationOutput.ref})`] : []),
+            ...(note ? [`- Note: ${note}`] : []),
+          ].join("\n");
+          const checks: MutationCheck[] = typeof partId === "number"
+            ? await checksFor(client, [[`/api/part/${partId}/`, { category_detail: true, location_detail: true }]])
+            : [];
+          return stageMutation(oauth, auth, input, summary, [{
+            method: "POST",
+            path: "/api/stock/remove/",
+            body: { items: [{ pk: mutationValue(stockId!), quantity: String(input.quantity) }], ...(note ? { notes: note } : {}) },
+          }], checks);
+        }
+        if (typeof partId !== "number" || (locationId !== undefined && typeof locationId !== "number")) {
+          throw new Error("Consuming planned entities requires an explicit stock_item_id ref from an earlier step");
+        }
+        if (!part) throw new Error("Part was not found");
         ensureUnlocked(part);
         const query = {
-          part: input.part_id,
-          location: input.location_id,
+          part: partId,
+          location: locationId,
           in_stock: true,
           available: true,
           limit: 100,
@@ -559,10 +746,10 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
             item.expired !== true &&
             numberValue(item.quantity) - numberValue(item.allocated) > 0,
         );
-        if (input.stock_item_id) {
-          const selected = await getStock(client, input.stock_item_id);
-          if (numberValue(selected.part) !== input.part_id) throw new Error("The selected stock item belongs to another part");
-          if (input.location_id && numberValue(selected.location) !== input.location_id) {
+        if (typeof stockId === "number") {
+          const selected = await getStock(client, stockId);
+          if (numberValue(selected.part) !== partId) throw new Error("The selected stock item belongs to another part");
+          if (typeof locationId === "number" && numberValue(selected.location) !== locationId) {
             throw new Error("The selected stock item is not in the requested location");
           }
           if (
@@ -600,7 +787,6 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           const available = input.quantity - remaining;
           throw new Error(`Insufficient eligible stock: requested ${input.quantity}, available ${available}`);
         }
-        const note = [input.reason, input.notes].filter(Boolean).join(": ");
         const summary = [
           `Consume ${formatQuantity(input.quantity, optionalString(part.units))} of ${formatRef(partRef(part))}:`,
           ...allocation.map(({ item, quantity }) =>
@@ -611,7 +797,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           ...(note ? [`- Note: ${note}`] : []),
         ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
-          [`/api/part/${input.part_id}/`, { category_detail: true, location_detail: true }],
+          [`/api/part/${partId}/`, { category_detail: true, location_detail: true }],
           ["/api/stock/", query],
           ...allocation.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
         ];
@@ -634,10 +820,10 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
         "Prepare moving one stock item, a quantity of one part from a source location, or every stock item under a source location. Total quantity is preserved.",
       inputSchema: {
         ...planInputFields,
-        destination_location_id: z.number().int().positive(),
-        stock_item_id: z.number().int().positive().optional(),
-        part_id: z.number().int().positive().optional(),
-        source_location_id: z.number().int().positive().optional(),
+        destination_location_id: entityIdSchema,
+        stock_item_id: entityIdSchema.optional(),
+        part_id: entityIdSchema.optional(),
+        source_location_id: entityIdSchema.optional(),
         quantity: positiveQuantity.optional(),
         all: z.boolean().default(false),
         include_sublocations: z.boolean().default(false),
@@ -653,11 +839,21 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           throw new Error("Select exactly one mode: stock_item_id, part_id with source_location_id, or source_location_id with all=true");
         }
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const destination = await getLocation(client, input.destination_location_id);
-        ensureStockDestination(destination);
+        const destinationId = normalizeEntityId(input.destination_location_id);
+        const stockId = input.stock_item_id === undefined ? undefined : normalizeEntityId(input.stock_item_id);
+        const partId = input.part_id === undefined ? undefined : normalizeEntityId(input.part_id);
+        const sourceId = input.source_location_id === undefined ? undefined : normalizeEntityId(input.source_location_id);
+        const destinationOutput = plannedOutput(oauth, auth, input.plan_id, destinationId, "stock_location");
+        const stockOutput = stockId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, stockId, "stock_item");
+        const destination = typeof destinationId === "number" ? await getLocation(client, destinationId) : undefined;
+        if (destination) ensureStockDestination(destination);
+        if (metadataBoolean(destinationOutput, "structural")) throw new Error(`${destinationOutput!.display} is structural and cannot directly contain stock`);
+        if (!stockOutput && (typeof partId === "string" || typeof sourceId === "string")) {
+          throw new Error("Moving from planned entities requires an explicit stock_item_id ref from an earlier step");
+        }
         const query = {
-          part: input.part_id,
-          location: input.source_location_id,
+          part: partId,
+          location: sourceId,
           cascade: input.include_sublocations,
           in_stock: true,
           limit: 100,
@@ -667,9 +863,13 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           path_detail: true,
         };
         let items: JsonRecord[];
-        if (input.stock_item_id) items = [await getStock(client, input.stock_item_id)];
+        if (typeof stockId === "number") items = [await getStock(client, stockId)];
+        else if (stockOutput) items = [];
         else items = pageResults(await client.get("/api/stock/", query));
-        if (!items.length) throw new Error("No matching stock items found to move");
+        if (stockOutput && input.quantity === undefined) {
+          throw new Error("quantity is required when moving a planned stock_item_id ref");
+        }
+        if (!items.length && !stockOutput) throw new Error("No matching stock items found to move");
         if (input.quantity !== undefined && items.length !== 1) {
           throw new Error("A partial quantity move requires exactly one matching stock item");
         }
@@ -680,28 +880,34 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           }
           return { item, quantity };
         });
+        const destinationDisplay = plannedLabel(destinationOutput, formatRef(refOrFallback(destination, "Location", Number(destinationId))));
+        const plannedMove = stockOutput ? [{ id: stockId!, quantity: input.quantity!, output: stockOutput }] : [];
         const summary = [
-          `Move stock to ${formatRef(refOrFallback(destination, "Location", input.destination_location_id))}:`,
+          `Move stock to ${destinationDisplay}:`,
           ...moveItems.map(({ item, quantity }) =>
             `- ${formatRef(stockPartRef(item))}: ${formatQuantity(quantity, optionalString(record(item.part_detail).units))} ` +
             `from ${formatRef(stockLocationRef(item))} [stock #${numberValue(item.pk)}]`,
           ),
+          ...plannedMove.map(({ output, quantity }) => `- Planned stock ${output.display} (ref ${output.ref}): ${formatQuantity(quantity)}`),
           ...(moveItems.some(({ item, quantity }) => quantity < numberValue(item.quantity))
             ? ["- Partial move: InvenTree will split the source and assign a new stock-item ID at commit."]
-            : ["- Full move: existing stock-item IDs are retained."]),
+            : stockOutput ? ["- Planned move: stock identity resolves at commit."] : ["- Full move: existing stock-item IDs are retained."]),
           ...(input.notes ? [`- Note: ${input.notes}`] : []),
         ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
-          [`/api/stock/location/${input.destination_location_id}/`, { path_detail: true }],
           ...moveItems.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
         ];
+        if (typeof destinationId === "number") checkPaths.unshift([`/api/stock/location/${destinationId}/`, { path_detail: true }]);
         if (!input.stock_item_id) checkPaths.push(["/api/stock/", query]);
         return stageMutation(oauth, auth, input, summary, [{
           method: "POST",
           path: "/api/stock/transfer/",
           body: {
-            items: moveItems.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
-            location: input.destination_location_id,
+            items: [
+              ...moveItems.map(({ item, quantity }) => ({ pk: numberValue(item.pk), quantity: String(quantity) })),
+              ...plannedMove.map(({ id, quantity }) => ({ pk: mutationValue(id), quantity: String(quantity) })),
+            ],
+            location: mutationValue(destinationId),
             ...(input.notes ? { notes: input.notes } : {}),
           },
         }], await checksFor(client, checkPaths));
@@ -715,8 +921,8 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare reconciliation of recorded stock quantities with observed physical counts.",
       inputSchema: {
         ...planInputFields,
-        counts: z.array(z.object({ stock_item_id: z.number().int().positive(), observed_quantity: z.number().nonnegative().finite() })).min(1).max(100),
-        location_id: z.number().int().positive().optional(),
+        counts: z.array(z.object({ stock_item_id: entityIdSchema, observed_quantity: z.number().nonnegative().finite() })).min(1).max(100),
+        location_id: entityIdSchema.optional(),
         notes: optionalText,
       },
       annotations: mutationAnnotations(true),
@@ -724,27 +930,31 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     },
     async (input, extra) =>
       safely(oauth, async () => {
-        const ids = input.counts.map((count) => count.stock_item_id);
+        const ids = input.counts.map((count) => normalizeEntityId(count.stock_item_id));
         if (new Set(ids).size !== ids.length) throw new Error("Each stock_item_id may be counted only once");
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const items = await Promise.all(ids.map((id) => getStock(client, id)));
-        if (input.location_id && items.some((item) => numberValue(item.location) !== input.location_id)) {
+        const locationId = input.location_id === undefined ? undefined : normalizeEntityId(input.location_id);
+        if (locationId !== undefined) plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
+        const entries = await Promise.all(input.counts.map(async (count, index) => {
+          const id = ids[index]!;
+          const output = plannedOutput(oauth, auth, input.plan_id, id, "stock_item");
+          const item = typeof id === "number" ? await getStock(client, id) : undefined;
+          return { id, output, item, observed: count.observed_quantity };
+        }));
+        if (typeof locationId === "number" && entries.some(({ item }) => item && numberValue(item.location) !== locationId)) {
           throw new Error("One or more stock items are not in the stated stocktake location");
         }
-        const changed = items.flatMap((item, index) => {
-          const count = input.counts[index]!;
-          return numberValue(item.quantity) === count.observed_quantity ? [] : [{ item, count }];
-        });
+        const changed = entries.filter(({ item, observed }) => !item || numberValue(item.quantity) !== observed);
         if (!changed.length) {
           return result(
             { status: "already_current", unchanged_stock_item_ids: ids },
-            `All ${items.length} observed stock quantities are already current; no plan step was created.`,
+            `${entries.length === 1 ? "The observed stock quantity is" : `All ${entries.length} observed stock quantities are`} already current; no plan step was created.`,
           );
         }
         const summary = [
           `Count ${changed.length} changed stock item${changed.length === 1 ? "" : "s"}:`,
-          ...changed.map(({ item, count }) => {
-            const observed = count.observed_quantity;
+          ...changed.map(({ id, item, output, observed }) => {
+            if (!item) return `- Planned stock ${output!.display} (ref ${String(id)}): assigned at commit -> ${observed}`;
             const current = numberValue(item.quantity);
             return `- ${formatRef(stockPartRef(item))} [stock #${numberValue(item.pk)}]: ${current} -> ${observed} (${observed - current >= 0 ? "+" : ""}${observed - current})`;
           }),
@@ -754,13 +964,18 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           method: "POST",
           path: "/api/stock/count/",
           body: {
-            items: changed.map(({ count }) => ({ pk: count.stock_item_id, quantity: String(count.observed_quantity) })),
-            ...(input.location_id ? { location: input.location_id } : {}),
+            items: changed.map(({ id, observed }) => ({ pk: mutationValue(id), quantity: String(observed) })),
+            ...(locationId !== undefined ? { location: mutationValue(locationId) } : {}),
             ...(input.notes ? { notes: input.notes } : {}),
           },
         }], await checksFor(
           client,
-          changed.map(({ item }) => [`/api/stock/${numberValue(item.pk)}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]),
+          [
+            ...changed.flatMap(({ id }) => typeof id === "number"
+              ? [[`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]]
+              : []),
+            ...(typeof locationId === "number" ? [[`/api/stock/location/${locationId}/`, { path_detail: true }] as [string, Record<string, unknown>]] : []),
+          ],
         ));
       }),
   );
@@ -772,7 +987,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       description: "Prepare marking stock items OK, damaged, lost, quarantined, or another supported semantic status.",
       inputSchema: {
         ...planInputFields,
-        stock_item_ids: z.array(z.number().int().positive()).min(1).max(100),
+        stock_item_ids: z.array(entityIdSchema).min(1).max(100),
         status: z.enum(["ok", "attention_needed", "damaged", "destroyed", "rejected", "lost", "quarantined", "returned"]),
         notes: optionalText,
       },
@@ -781,13 +996,19 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
     },
     async (input, extra) =>
       safely(oauth, async () => {
-        const ids = [...new Set(input.stock_item_ids)];
+        const ids = [...new Set(input.stock_item_ids.map(normalizeEntityId))];
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const items = await Promise.all(ids.map((id) => getStock(client, id)));
+        const entries = await Promise.all(ids.map(async (id) => ({
+          id,
+          output: plannedOutput(oauth, auth, input.plan_id, id, "stock_item"),
+          item: typeof id === "number" ? await getStock(client, id) : undefined,
+        })));
         const statusCode = STATUS_CODES[input.status];
         const summary = [
           `Set stock status to ${input.status.replaceAll("_", " ")} (${statusCode}):`,
-          ...items.map((item) => `- ${formatRef(stockPartRef(item))} [stock #${numberValue(item.pk)}]: ${optionalString(item.status_text) ?? item.status} -> ${input.status.replaceAll("_", " ")}`),
+          ...entries.map(({ id, item, output }) => item
+            ? `- ${formatRef(stockPartRef(item))} [stock #${numberValue(item.pk)}]: ${optionalString(item.status_text) ?? item.status} -> ${input.status.replaceAll("_", " ")}`
+            : `- Planned stock ${output!.display} (ref ${String(id)}): assigned at commit -> ${input.status.replaceAll("_", " ")}`),
           ...(input.notes ? [`- Note: ${input.notes}`] : []),
         ].join("\n");
         return stageMutation(
@@ -795,8 +1016,10 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
           auth,
           input,
           summary,
-          [{ method: "POST", path: "/api/stock/change_status/", body: { items: ids, status: statusCode, ...(input.notes ? { note: input.notes } : {}) } }],
-          await checksFor(client, ids.map((id) => [`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>])),
+          [{ method: "POST", path: "/api/stock/change_status/", body: { items: ids.map((id) => mutationValue(id)), status: statusCode, ...(input.notes ? { note: input.notes } : {}) } }],
+          await checksFor(client, ids.flatMap((id) => typeof id === "number"
+            ? [[`/api/stock/${id}/`, { part_detail: true, location_detail: true, path_detail: true }] as [string, Record<string, unknown>]]
+            : [])),
         );
       }),
   );
@@ -855,7 +1078,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService): void
       const plan = removePlanStep(oauth, auth, input.plan_id, input.expected_version, input.step_id, input.cascade);
       return result(
         { status: "staged", plan_id: plan.id, plan_version: plan.version, remaining_step_ids: plan.steps.map((step) => step.id) },
-        `Removed ${input.step_id}${input.cascade ? " and its dependent steps" : ""}. Plan ${plan.id} is now version ${plan.version} with ${plan.steps.length} steps.`,
+        `Removed ${input.step_id}${input.cascade ? " and its dependent steps" : ""}. Plan ${plan.id} is now version ${plan.version} with ${plan.steps.length} step${plan.steps.length === 1 ? "" : "s"}.`,
       );
     }),
   );
@@ -911,10 +1134,10 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
   const categoryFields = {
     ...planInputFields,
     name: z.string().min(1).max(100),
-    parent_id: z.number().int().positive().nullable().optional(),
+    parent_id: nullableEntityIdSchema.optional(),
     description: z.string().max(250).default(""),
     structural: z.boolean().default(false),
-    default_location_id: z.number().int().positive().nullable().optional(),
+    default_location_id: nullableEntityIdSchema.optional(),
     default_keywords: z.string().max(250).nullable().optional(),
   };
   server.registerTool(
@@ -929,31 +1152,44 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
     async (input, extra) =>
       safely(oauth, async () => {
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const parent = input.parent_id ? await getCategory(client, input.parent_id) : undefined;
-        const location = input.default_location_id ? await getLocation(client, input.default_location_id) : undefined;
+        const parentId = input.parent_id === null || input.parent_id === undefined ? input.parent_id : normalizeEntityId(input.parent_id);
+        const locationId = input.default_location_id === null || input.default_location_id === undefined
+          ? input.default_location_id
+          : normalizeEntityId(input.default_location_id);
+        const parentOutput = parentId === null || parentId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, parentId, "part_category");
+        const locationOutput = locationId === null || locationId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
+        const parent = typeof parentId === "number" ? await getCategory(client, parentId) : undefined;
+        const location = typeof locationId === "number" ? await getLocation(client, locationId) : undefined;
         if (location) ensureStockDestination(location);
+        if (metadataBoolean(locationOutput, "structural")) {
+          throw new Error(`${locationOutput!.display} is structural and cannot directly contain stock`);
+        }
         const siblingsQuery = {
-          ...(input.parent_id ? { parent: input.parent_id } : { top_level: true }),
+          ...(typeof parentId === "number" ? { parent: parentId } : { top_level: true }),
           name: input.name,
           limit: 20,
           offset: 0,
         };
-        const siblings = await client.get("/api/part/category/", siblingsQuery);
+        const siblings = typeof parentId === "string" ? { results: [] } : await client.get("/api/part/category/", siblingsQuery);
         if (pageResults(siblings).some((item) => stringValue(item.name).localeCompare(input.name, undefined, { sensitivity: "base" }) === 0)) {
           throw new Error(`A category named ${input.name} already exists under the selected parent`);
         }
-        const path = [parent ? stringValue(parent.pathstring) : "", input.name].filter(Boolean).join("/");
+        const parentPath = parentOutput?.display ?? (parent ? stringValue(parent.pathstring) : "");
+        const path = [parentPath, input.name].filter(Boolean).join("/");
         const summary = [
           `Create part category ${displayPath(path)}`,
           `- Structural: ${input.structural ? "yes" : "no"}`,
           ...(input.description ? [`- Description: ${input.description}`] : []),
-          ...(location ? [`- Default location: ${formatRef(refOrFallback(location, "Location", input.default_location_id!))}`] : []),
+          ...(locationId !== null && locationId !== undefined
+            ? [`- Default location: ${plannedLabel(locationOutput, formatRef(refOrFallback(location, "Location", Number(locationId))))}`]
+            : []),
           ...(input.default_keywords ? [`- Default keywords: ${input.default_keywords}`] : []),
         ].join("\n");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [["/api/part/category/", siblingsQuery]];
-        if (parent) checkPaths.push([`/api/part/category/${input.parent_id}/`, { path_detail: true }]);
-        if (location) checkPaths.push([`/api/stock/location/${input.default_location_id}/`, { path_detail: true }]);
-        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/part/category/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, ...(input.default_location_id !== undefined ? { default_location: input.default_location_id } : {}), ...(input.default_keywords !== undefined ? { default_keywords: input.default_keywords } : {}) } }], await checksFor(client, checkPaths), [{ name: "part_category", entityType: "part_category", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path) }]);
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof parentId !== "string") checkPaths.push(["/api/part/category/", siblingsQuery]);
+        if (typeof parentId === "number") checkPaths.push([`/api/part/category/${parentId}/`, { path_detail: true }]);
+        if (typeof locationId === "number") checkPaths.push([`/api/stock/location/${locationId}/`, { path_detail: true }]);
+        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/part/category/", body: { name: input.name, parent: mutationValue(parentId ?? null), description: input.description, structural: input.structural, ...(locationId !== undefined ? { default_location: mutationValue(locationId) } : {}), ...(input.default_keywords !== undefined ? { default_keywords: input.default_keywords } : {}) } }], await checksFor(client, checkPaths), [{ name: "part_category", entityType: "part_category", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path), metadata: { path: displayPath(path), structural: input.structural } }]);
       }),
   );
 
@@ -964,13 +1200,13 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       description: "Prepare renaming, reparenting, or changing defaults for a part category, with descendant impact shown.",
       inputSchema: {
         ...planInputFields,
-        category_id: z.number().int().positive(),
+        category_id: entityIdSchema,
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
-          parent_id: z.number().int().positive().nullable().optional(),
+          parent_id: nullableEntityIdSchema.optional(),
           description: z.string().max(250).optional(),
           structural: z.boolean().optional(),
-          default_location_id: z.number().int().positive().nullable().optional(),
+          default_location_id: nullableEntityIdSchema.optional(),
           default_keywords: z.string().max(250).nullable().optional(),
         }),
       },
@@ -979,34 +1215,48 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
     },
     async (input, extra) =>
       safely(oauth, async () => {
-        const { category_id, changes } = input;
+        const { changes } = input;
+        const category_id = normalizeEntityId(input.category_id);
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const category = await getCategory(client, category_id);
-        if (changes.parent_id === category_id) throw new Error("A category cannot be its own parent");
-        const newParent = changes.parent_id ? await getCategory(client, changes.parent_id) : undefined;
+        const categoryOutput = plannedOutput(oauth, auth, input.plan_id, category_id, "part_category");
+        const category = typeof category_id === "number" ? await getCategory(client, category_id) : undefined;
+        const parentId = changes.parent_id === null || changes.parent_id === undefined ? changes.parent_id : normalizeEntityId(changes.parent_id);
+        if (parentId === category_id) throw new Error("A category cannot be its own parent");
+        const parentOutput = parentId === null || parentId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, parentId, "part_category");
+        const newParent = typeof parentId === "number" ? await getCategory(client, parentId) : undefined;
         if (
+          category &&
           newParent &&
           stringValue(newParent.pathstring).startsWith(`${stringValue(category.pathstring)}/`)
         ) {
           throw new Error("A category cannot be moved below one of its own descendants");
         }
-        if (changes.default_location_id) ensureStockDestination(await getLocation(client, changes.default_location_id));
+        const defaultLocationId = changes.default_location_id === null || changes.default_location_id === undefined
+          ? changes.default_location_id
+          : normalizeEntityId(changes.default_location_id);
+        const defaultLocationOutput = defaultLocationId === null || defaultLocationId === undefined
+          ? undefined
+          : plannedOutput(oauth, auth, input.plan_id, defaultLocationId, "stock_location");
+        if (typeof defaultLocationId === "number") ensureStockDestination(await getLocation(client, defaultLocationId));
+        if (metadataBoolean(defaultLocationOutput, "structural")) {
+          throw new Error(`${defaultLocationOutput!.display} is structural and cannot directly contain stock`);
+        }
         let siblingCheck: Record<string, unknown> | undefined;
         if (changes.name !== undefined || changes.parent_id !== undefined) {
-          const targetParent = changes.parent_id !== undefined ? changes.parent_id : category.parent;
+          const targetParent = parentId !== undefined ? parentId : category?.parent;
           const siblingQuery = {
-            ...(targetParent ? { parent: numberValue(targetParent) } : { top_level: true }),
-            name: changes.name ?? stringValue(category.name),
+            ...(typeof targetParent === "number" && targetParent ? { parent: targetParent } : { top_level: true }),
+            name: changes.name ?? stringValue(category?.name),
             limit: 20,
             offset: 0,
           };
           siblingCheck = siblingQuery;
-          const siblings = pageResults(await client.get("/api/part/category/", siblingQuery));
+          const siblings = typeof targetParent === "string" ? [] : pageResults(await client.get("/api/part/category/", siblingQuery));
           if (
             siblings.some(
               (item) =>
                 numberValue(item.pk) !== category_id &&
-                stringValue(item.name).localeCompare(changes.name ?? stringValue(category.name), undefined, {
+                stringValue(item.name).localeCompare(changes.name ?? stringValue(category?.name), undefined, {
                   sensitivity: "base",
                 }) === 0,
             )
@@ -1014,7 +1264,7 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
             throw new Error("A category with that name already exists under the selected parent");
           }
         }
-        if (changes.structural === true && numberValue(category.part_count) > 0) {
+        if (category && changes.structural === true && numberValue(category.part_count) > 0) {
           throw new Error("A category containing parts cannot be made structural");
         }
         const mapping: Array<[keyof typeof changes, string, string]> = [
@@ -1026,36 +1276,48 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
         const diffs = mapping.flatMap(([key, upstream, label]) => {
           const value = changes[key];
           if (value === undefined) return [];
-          body[upstream] = value;
-          return beforeAfter(label, category[upstream], value) ?? [];
+          const normalizedValue = key === "parent_id" ? parentId : key === "default_location_id" ? defaultLocationId : value;
+          body[upstream] = key === "parent_id" || key === "default_location_id"
+            ? mutationValue(normalizedValue as EntityId | null)
+            : normalizedValue;
+          const displayValue = key === "parent_id" && parentOutput
+            ? parentOutput.display
+            : key === "default_location_id" && defaultLocationOutput
+              ? defaultLocationOutput.display
+              : normalizedValue;
+          return category
+            ? beforeAfter(label, category[upstream], displayValue) ?? []
+            : [`- ${label}: assigned at commit -> ${JSON.stringify(displayValue)}`];
         });
         if (!diffs.length) throw new Error("No category changes are required");
-        const oldPath = stringValue(category.pathstring) || stringValue(category.name);
-        const currentParentPath = oldPath.split("/").slice(0, -1).join("/");
+        const oldPath = category ? stringValue(category.pathstring) || stringValue(category.name) : categoryOutput!.display;
+        const oldPathSegments = pathSegments(oldPath);
+        const currentParentPath = oldPathSegments.slice(0, -1).join(" > ");
         const newParentPath =
           changes.parent_id === undefined
             ? currentParentPath
-            : newParent
-              ? stringValue(newParent.pathstring)
-              : "";
-        const newPath = [newParentPath, changes.name ?? stringValue(category.name)].filter(Boolean).join("/");
+            : parentOutput?.display ?? (newParent ? displayPath(stringValue(newParent.pathstring)) : "");
+        const newName = changes.name ?? (stringValue(category?.name) || oldPathSegments.at(-1));
+        const newPath = [newParentPath, newName].filter(Boolean).join(" > ");
         const summary = [
-          `Update category ${formatRef(refOrFallback(category, "Category", category_id))}:`,
+          `Update category ${plannedLabel(categoryOutput, formatRef(refOrFallback(category, "Category", Number(category_id))))}:`,
           ...(oldPath !== newPath ? [`- Path: ${displayPath(oldPath)} -> ${displayPath(newPath)}`] : []),
           ...diffs,
-          `- Impact: ${numberValue(category.subcategories)} descendant categories; ${numberValue(category.part_count)} directly assigned parts`,
+          ...(category ? [`- Impact: ${numberValue(category.subcategories)} descendant categories; ${numberValue(category.part_count)} directly assigned parts`] : []),
         ].join("\n");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [[`/api/part/category/${category_id}/`, { path_detail: true }]];
-        if (newParent) checkPaths.push([`/api/part/category/${changes.parent_id}/`, { path_detail: true }]);
-        if (siblingCheck) checkPaths.push(["/api/part/category/", siblingCheck]);
-        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: `/api/part/category/${category_id}/`, body }], await checksFor(client, checkPaths));
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof category_id === "number") checkPaths.push([`/api/part/category/${category_id}/`, { path_detail: true }]);
+        if (typeof parentId === "number") checkPaths.push([`/api/part/category/${parentId}/`, { path_detail: true }]);
+        if (typeof defaultLocationId === "number") checkPaths.push([`/api/stock/location/${defaultLocationId}/`, { path_detail: true }]);
+        if (siblingCheck && typeof (parentId !== undefined ? parentId : category?.parent) !== "string") checkPaths.push(["/api/part/category/", siblingCheck]);
+        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: mutationPath("/api/part/category/", category_id), body }], await checksFor(client, checkPaths));
       }),
   );
 
   const locationFields = {
     ...planInputFields,
     name: z.string().min(1).max(100),
-    parent_id: z.number().int().positive().nullable().optional(),
+    parent_id: nullableEntityIdSchema.optional(),
     description: z.string().max(250).default(""),
     structural: z.boolean().default(false),
     tags: z.array(z.string()).default([]),
@@ -1072,27 +1334,30 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
     async (input, extra) =>
       safely(oauth, async () => {
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const parent = input.parent_id ? await getLocation(client, input.parent_id) : undefined;
+        const parentId = input.parent_id === null || input.parent_id === undefined ? input.parent_id : normalizeEntityId(input.parent_id);
+        const parentOutput = parentId === null || parentId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, parentId, "stock_location");
+        const parent = typeof parentId === "number" ? await getLocation(client, parentId) : undefined;
         const siblingsQuery = {
-          ...(input.parent_id ? { parent: input.parent_id } : { top_level: true }),
+          ...(typeof parentId === "number" ? { parent: parentId } : { top_level: true }),
           name: input.name,
           limit: 20,
           offset: 0,
         };
-        const siblings = await client.get("/api/stock/location/", siblingsQuery);
+        const siblings = typeof parentId === "string" ? { results: [] } : await client.get("/api/stock/location/", siblingsQuery);
         if (pageResults(siblings).some((item) => stringValue(item.name).localeCompare(input.name, undefined, { sensitivity: "base" }) === 0)) {
           throw new Error(`A location named ${input.name} already exists under the selected parent`);
         }
-        const path = [parent ? stringValue(parent.pathstring) : "", input.name].filter(Boolean).join("/");
+        const path = [parentOutput?.display ?? (parent ? stringValue(parent.pathstring) : ""), input.name].filter(Boolean).join("/");
         const summary = [
           `Create stock location ${displayPath(path)}`,
           `- Structural: ${input.structural ? "yes" : "no"}`,
           ...(input.description ? [`- Description: ${input.description}`] : []),
           ...(input.tags.length ? [`- Tags: ${input.tags.join(", ")}`] : []),
         ].join("\n");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [["/api/stock/location/", siblingsQuery]];
-        if (parent) checkPaths.push([`/api/stock/location/${input.parent_id}/`, { path_detail: true }]);
-        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/stock/location/", body: { name: input.name, parent: input.parent_id ?? null, description: input.description, structural: input.structural, tags: input.tags } }], await checksFor(client, checkPaths), [{ name: "stock_location", entityType: "stock_location", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path) }]);
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof parentId !== "string") checkPaths.push(["/api/stock/location/", siblingsQuery]);
+        if (typeof parentId === "number") checkPaths.push([`/api/stock/location/${parentId}/`, { path_detail: true }]);
+        return stageMutation(oauth, auth, input, summary, [{ method: "POST", path: "/api/stock/location/", body: { name: input.name, parent: mutationValue(parentId ?? null), description: input.description, structural: input.structural, tags: input.tags } }], await checksFor(client, checkPaths), [{ name: "stock_location", entityType: "stock_location", requestIndex: 0, responsePaths: [["pk"]], display: displayPath(path), metadata: { path: displayPath(path), structural: input.structural } }]);
       }),
   );
 
@@ -1103,10 +1368,10 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
       description: "Prepare renaming, reparenting, or changing a physical stock location, with descendant and item impact shown.",
       inputSchema: {
         ...planInputFields,
-        location_id: z.number().int().positive(),
+        location_id: entityIdSchema,
         changes: z.object({
           name: z.string().min(1).max(100).optional(),
-          parent_id: z.number().int().positive().nullable().optional(),
+          parent_id: nullableEntityIdSchema.optional(),
           description: z.string().max(250).optional(),
           structural: z.boolean().optional(),
           tags: z.array(z.string()).optional(),
@@ -1117,36 +1382,41 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
     },
     async (input, extra) =>
       safely(oauth, async () => {
-        const { location_id, changes } = input;
+        const { changes } = input;
+        const location_id = normalizeEntityId(input.location_id);
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
-        const location = await getLocation(client, location_id);
-        if (changes.parent_id === location_id) throw new Error("A location cannot be its own parent");
-        const newParent = changes.parent_id ? await getLocation(client, changes.parent_id) : undefined;
+        const locationOutput = plannedOutput(oauth, auth, input.plan_id, location_id, "stock_location");
+        const location = typeof location_id === "number" ? await getLocation(client, location_id) : undefined;
+        const parentId = changes.parent_id === null || changes.parent_id === undefined ? changes.parent_id : normalizeEntityId(changes.parent_id);
+        if (parentId === location_id) throw new Error("A location cannot be its own parent");
+        const parentOutput = parentId === null || parentId === undefined ? undefined : plannedOutput(oauth, auth, input.plan_id, parentId, "stock_location");
+        const newParent = typeof parentId === "number" ? await getLocation(client, parentId) : undefined;
         if (
+          location &&
           newParent &&
           stringValue(newParent.pathstring).startsWith(`${stringValue(location.pathstring)}/`)
         ) {
           throw new Error("A location cannot be moved below one of its own descendants");
         }
-        if (changes.structural === true && numberValue(location.items) > 0) {
+        if (location && changes.structural === true && numberValue(location.items) > 0) {
           throw new Error("A location containing stock cannot be made structural");
         }
         let siblingCheck: Record<string, unknown> | undefined;
         if (changes.name !== undefined || changes.parent_id !== undefined) {
-          const targetParent = changes.parent_id !== undefined ? changes.parent_id : location.parent;
+          const targetParent = parentId !== undefined ? parentId : location?.parent;
           const siblingQuery = {
-            ...(targetParent ? { parent: numberValue(targetParent) } : { top_level: true }),
-            name: changes.name ?? stringValue(location.name),
+            ...(typeof targetParent === "number" && targetParent ? { parent: targetParent } : { top_level: true }),
+            name: changes.name ?? stringValue(location?.name),
             limit: 20,
             offset: 0,
           };
           siblingCheck = siblingQuery;
-          const siblings = pageResults(await client.get("/api/stock/location/", siblingQuery));
+          const siblings = typeof targetParent === "string" ? [] : pageResults(await client.get("/api/stock/location/", siblingQuery));
           if (
             siblings.some(
               (item) =>
                 numberValue(item.pk) !== location_id &&
-                stringValue(item.name).localeCompare(changes.name ?? stringValue(location.name), undefined, {
+                stringValue(item.name).localeCompare(changes.name ?? stringValue(location?.name), undefined, {
                   sensitivity: "base",
                 }) === 0,
             )
@@ -1162,29 +1432,34 @@ function registerStructureTools(server: McpServer, oauth: OAuthService): void {
         const diffs = mapping.flatMap(([key, upstream, label]) => {
           const value = changes[key];
           if (value === undefined) return [];
-          body[upstream] = value;
-          return beforeAfter(label, location[upstream], value) ?? [];
+          const normalizedValue = key === "parent_id" ? parentId : value;
+          body[upstream] = key === "parent_id" ? mutationValue(normalizedValue as EntityId | null) : normalizedValue;
+          const displayValue = key === "parent_id" && parentOutput ? parentOutput.display : normalizedValue;
+          return location
+            ? beforeAfter(label, location[upstream], displayValue) ?? []
+            : [`- ${label}: assigned at commit -> ${JSON.stringify(displayValue)}`];
         });
         if (!diffs.length) throw new Error("No location changes are required");
-        const oldPath = stringValue(location.pathstring) || stringValue(location.name);
-        const currentParentPath = oldPath.split("/").slice(0, -1).join("/");
+        const oldPath = location ? stringValue(location.pathstring) || stringValue(location.name) : locationOutput!.display;
+        const oldPathSegments = pathSegments(oldPath);
+        const currentParentPath = oldPathSegments.slice(0, -1).join(" > ");
         const newParentPath =
           changes.parent_id === undefined
             ? currentParentPath
-            : newParent
-              ? stringValue(newParent.pathstring)
-              : "";
-        const newPath = [newParentPath, changes.name ?? stringValue(location.name)].filter(Boolean).join("/");
+            : parentOutput?.display ?? (newParent ? displayPath(stringValue(newParent.pathstring)) : "");
+        const newName = changes.name ?? (stringValue(location?.name) || oldPathSegments.at(-1));
+        const newPath = [newParentPath, newName].filter(Boolean).join(" > ");
         const summary = [
-          `Update location ${formatRef(refOrFallback(location, "Location", location_id))}:`,
+          `Update location ${plannedLabel(locationOutput, formatRef(refOrFallback(location, "Location", Number(location_id))))}:`,
           ...(oldPath !== newPath ? [`- Path: ${displayPath(oldPath)} -> ${displayPath(newPath)}`] : []),
           ...diffs,
-          `- Impact: ${numberValue(location.sublocations)} descendant locations; ${numberValue(location.items)} stock items`,
+          ...(location ? [`- Impact: ${numberValue(location.sublocations)} descendant locations; ${numberValue(location.items)} stock items`] : []),
         ].join("\n");
-        const checkPaths: Array<[string, Record<string, unknown>?]> = [[`/api/stock/location/${location_id}/`, { path_detail: true }]];
-        if (newParent) checkPaths.push([`/api/stock/location/${changes.parent_id}/`, { path_detail: true }]);
-        if (siblingCheck) checkPaths.push(["/api/stock/location/", siblingCheck]);
-        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: `/api/stock/location/${location_id}/`, body }], await checksFor(client, checkPaths));
+        const checkPaths: Array<[string, Record<string, unknown>?]> = [];
+        if (typeof location_id === "number") checkPaths.push([`/api/stock/location/${location_id}/`, { path_detail: true }]);
+        if (typeof parentId === "number") checkPaths.push([`/api/stock/location/${parentId}/`, { path_detail: true }]);
+        if (siblingCheck && typeof (parentId !== undefined ? parentId : location?.parent) !== "string") checkPaths.push(["/api/stock/location/", siblingCheck]);
+        return stageMutation(oauth, auth, input, summary, [{ method: "PATCH", path: mutationPath("/api/stock/location/", location_id), body }], await checksFor(client, checkPaths));
       }),
   );
 }
@@ -1233,28 +1508,28 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
           stock_location: (id: number) => `/api/stock/location/${id}/`,
         } as const;
         const expectedType = input.entity_type;
-        const reviewed = input.plan_id ? reviewPlan(oauth, auth, input.plan_id).plan : undefined;
         const resolved = await Promise.all(input.entities.map(async (selector) => {
-          if ("ref" in selector) {
-            if (!reviewed) throw new Error("plan_id is required when an entity selector uses ref");
-            const output = reviewed.steps.flatMap((step) => step.outputs).find((candidate) => candidate.ref === selector.ref);
-            if (!output) throw new Error(`Unknown plan reference: ${selector.ref}`);
-            if (output.entityType !== expectedType) {
-              throw new Error(`Plan reference ${selector.ref} is ${output.entityType}, not ${expectedType}`);
-            }
-            return { item: { __planRef: selector.ref }, label: output.display, suffix: `ref ${selector.ref}` };
+          const id = selectorId(selector);
+          const output = plannedOutput(oauth, auth, input.plan_id, id, expectedType);
+          if (output) {
+            return { item: mutationValue(id), label: output.display, suffix: `ref ${output.ref}` };
           }
           const query = input.entity_type === "stock_item"
             ? { part_detail: true, location_detail: true, path_detail: true }
             : { path_detail: true };
-          const value = record(await client.get(entityPaths[input.entity_type](selector.id), query));
+          const numericId = Number(id);
+          const value = record(await client.get(entityPaths[input.entity_type](numericId), query));
           let label = optionalString(value.pathstring)
             ? displayPath(stringValue(value.pathstring))
             : optionalString(value.name) ?? optionalString(value.full_name);
           if (input.entity_type === "stock_item") {
             label = `${formatRef(stockPartRef(value))} in ${formatRef(stockLocationRef(value))}`;
           }
-          return { item: selector.id, label: label ?? `${input.entity_type} #${selector.id}`, suffix: `#${selector.id}` };
+          return {
+            item: numericId,
+            label: label ?? `${input.entity_type} #${numericId}`,
+            suffix: input.entity_type === "stock_item" ? `stock #${numericId}` : `#${numericId}`,
+          };
         }));
         const summary = [
           `Print ${input.copies} cop${input.copies === 1 ? "y" : "ies"} of ${resolved.length} ${input.entity_type.replaceAll("_", " ")} label${resolved.length === 1 ? "" : "s"}:`,
@@ -1264,9 +1539,12 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
         ].join("\n");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [
           ["/api/label/template/", query],
-          ...input.entities.flatMap((selector) => "id" in selector
-            ? [[entityPaths[input.entity_type](selector.id), input.entity_type === "stock_item" ? { part_detail: true, location_detail: true, path_detail: true } : { path_detail: true }] as [string, Record<string, unknown>]]
-            : []),
+          ...input.entities.flatMap((selector) => {
+            const id = selectorId(selector);
+            return typeof id === "number"
+              ? [[entityPaths[input.entity_type](id), input.entity_type === "stock_item" ? { part_detail: true, location_detail: true, path_detail: true } : { path_detail: true }] as [string, Record<string, unknown>]]
+              : [];
+          }),
         ];
         const requests: MutationRequest[] = Array.from({ length: input.copies }, () => ({
           method: "POST" as const,
