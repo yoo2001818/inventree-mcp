@@ -110,7 +110,7 @@ export function createApp(
     if (!match?.[1]) {
       res.set(
         "WWW-Authenticate",
-        `Bearer resource_metadata="${resourceMetadataUrl}", scope="inventree.read"`,
+        `Bearer resource_metadata="${resourceMetadataUrl}", scope="inventree.read inventree.write"`,
       );
       res.status(401).json({
         error: "invalid_token",

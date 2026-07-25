@@ -14,7 +14,7 @@ function oauthError(res: Response, status: number, error: string, description: s
 }
 
 function parseScopes(value: unknown): string[] {
-  const scopes = String(value ?? "inventree.read")
+  const scopes = String(value ?? "inventree.read inventree.write")
     .split(/\s+/)
     .filter(Boolean);
   if (scopes.length === 0 || scopes.some((scope) => !ALLOWED_SCOPES.has(scope))) {
