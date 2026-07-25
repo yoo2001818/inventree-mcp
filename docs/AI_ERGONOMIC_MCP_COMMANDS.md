@@ -490,36 +490,21 @@ Printing is a real-world side effect. Always preview the entity names/paths, pri
 
 ## Mutation safety protocol
 
-A literal confirmation string inside a generic write schema is easy for a model to copy and does not bind confirmation to a particular proposed change. Prefer a server-backed two-step protocol.
+> Revised after live testing: the original one-operation-per-plan protocol was insufficient for composed workflows. The canonical follow-up design and observed issues are recorded in [`MCP_LIVE_ERGONOMICS_REVIEW.md`](MCP_LIVE_ERGONOMICS_REVIEW.md).
 
-### Step 1: prepare
+Mutation tools stage steps in one shared plan. Staging changes only temporary bridge state, is non-destructive, and must not ask the user for confirmation. If `plan_id` is omitted, the first staging call creates a plan; later calls append to it.
 
-Each write tool runs in preview mode by default, validates IDs and current state, and returns:
+Each staged create operation declares outputs and returns opaque plan-scoped references. Later steps can use those references before InvenTree has assigned numeric IDs. For example, a print step can refer to the stock item that an earlier create step will produce.
 
-```json
-{
-  "status": "confirmation_required",
-  "plan_id": "opaque-short-lived-id",
-  "expires_at": "2026-07-25T12:34:56Z",
-  "summary": "human-readable Markdown preview"
-}
-```
+Future references are local to the `plan_id` supplied on each staging call, so their public representation does not repeat the plan ID. Each step and declared output receives an immutable opaque ID; human-facing step numbers are presentation only and may change when a step is removed. Models only copy server-issued references; they never construct them.
 
-The server stores the normalized operation, target IDs, relevant before-state values, and authenticated owner. Plan IDs should be single-use and expire quickly.
+`review_inventory_plan` returns the complete canonical preview. Only then does the assistant ask the user for confirmation.
 
-### Step 2: commit
+After confirmation, `commit_inventory_plan(plan_id, expected_version)` freezes and revalidates the plan, executes steps in dependency order, resolves future references from earlier results, and returns the final ID mapping.
 
-After the user confirms the displayed summary, call:
+Only the commit tool is destructive. Staging and plan-editing tools use `destructiveHint: false`; the commit tool uses `destructiveHint: true`. Append operations use idempotency keys and plan versions to prevent duplicate or lost updates.
 
-```text
-commit_inventory_change(plan_id)
-```
-
-Before writing, the server re-reads the target and rejects the plan if relevant state changed. The result should report exact created/updated entity IDs and final quantities.
-
-This design keeps workflow tools narrow while providing one consistent confirmation mechanism. It also makes a user's "yes" refer to an immutable, visible plan rather than to arbitrary arguments generated after confirmation.
-
-For clients that cannot support stored plans, a second-best design is a `preview: true` call that returns a digest, followed by the same call with `preview: false` and `expected_digest`. Do not fall back to an unbound boolean such as `confirm: true`.
+Several InvenTree requests committed from one plan are orchestrated as one reviewed action but are not an upstream database transaction. Partial completion must be reported precisely; automatic rollback must not be assumed.
 
 ## Error and ambiguity contracts
 
@@ -557,18 +542,19 @@ One MCP call should normally answer this question.
 ### "Add these 200 capacitors to my inventory"
 
 1. `find_parts` to check for duplicates.
-2. If the part exists, use `browse_stock_locations` only if the destination is unresolved, then prepare `receive_stock`.
-3. If it does not exist, use `browse_part_categories` and `browse_stock_locations`, then prepare `create_part_with_stock`.
-4. Show the mutation preview and ask for confirmation.
-5. `commit_inventory_change` after confirmation.
-6. Offer `print_labels` only if a new stock item/location was created or the user asked for labels.
+2. If the part exists, use `browse_stock_locations` only if the destination is unresolved, then stage `receive_stock` in a new plan.
+3. If it does not exist, use `browse_part_categories` and `browse_stock_locations`, then stage `create_part_with_stock` in a new plan.
+4. If a label is wanted, append `print_labels` to the same plan using the server-issued reference to the planned stock item.
+5. Call `review_inventory_plan` and show the complete consolidated preview.
+6. Ask for confirmation once.
+7. Call `commit_inventory_plan` after confirmation.
 
 ### "I used five from the workbench"
 
 1. `find_parts` if the part is not already in context.
-2. Prepare `consume_stock` with the resolved workbench location.
+2. Stage `consume_stock` with the resolved workbench location.
 3. If multiple eligible stock items remain, show candidates or the explicit allocation plan.
-4. Commit after confirmation.
+4. Review the plan, ask once for confirmation, and commit it.
 
 ### "What is actually in drawer A3?"
 
@@ -579,10 +565,11 @@ One MCP call should normally answer this question.
 ### "Reorganize this cabinet"
 
 1. Read the location subtree and its inventory.
-2. Prepare location creates/renames first.
-3. Prepare stock moves against the resulting destination IDs.
-4. Commit in dependency order, with a clear boundary between structure changes and stock movement.
-5. Print new location labels only after final paths are confirmed.
+2. Stage location creates/renames in one plan.
+3. Append stock moves using server-issued references for planned destination locations.
+4. Append label printing for the final planned locations.
+5. Review the complete dependency-ordered plan and ask once for confirmation.
+6. Commit the plan, while preserving a clear report boundary between structure changes, stock movement, and printing.
 
 ## Recommended tool set and priority
 
@@ -605,7 +592,10 @@ This phase is read-only and immediately reduces context use and call count. It s
 4. `consume_stock`
 5. `move_stock`
 6. `count_stock`
-7. `commit_inventory_change`
+7. `review_inventory_plan`
+8. `remove_inventory_plan_step`
+9. `discard_inventory_plan`
+10. `commit_inventory_plan`
 
 After these are proven, disable `inventree_write` by default. Keep it behind an explicit deployment flag for development.
 

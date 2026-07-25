@@ -54,6 +54,7 @@ Dedicated write tools validate exact IDs and prepare a short-lived immutable pla
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
+Live-test findings and the proposed shared-plan / future-entity-reference design are in [`docs/MCP_LIVE_ERGONOMICS_REVIEW.md`](docs/MCP_LIVE_ERGONOMICS_REVIEW.md).
 
 ## Deploy with Docker Compose
 
