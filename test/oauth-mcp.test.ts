@@ -522,6 +522,10 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.equal(search.body.result.structuredContent.data.results[0].placements[0].expired, undefined);
     assert.equal(search.body.result.structuredContent.data.results[0].placements[0].status, undefined);
     assert.match(search.body.result.content[0].text, /Drawer A3 \(#81\)/);
+    const toolLog = requestLogs.find((message) => message.includes("MCP tools/call") && message.includes('"name":"find_parts"'));
+    assert.ok(toolLog);
+    assert.match(toolLog, /"arguments":\{"query":"10k"/);
+    assert.equal(requestLogs.some((message) => message.includes("POST /mcp")), false);
 
     const refusedWrite = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",

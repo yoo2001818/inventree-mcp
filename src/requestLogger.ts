@@ -4,6 +4,7 @@ import morgan from "morgan";
 export function createRequestLogger(stream: morgan.StreamOptions = process.stdout) {
   return morgan<Request, Response>(
     (tokens, req, res) => {
+      if (req.path === "/mcp") return undefined;
       const token = (name: string, argument?: string | number | boolean) =>
         tokens[name]?.(req, res, argument) ?? "-";
 

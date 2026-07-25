@@ -829,6 +829,8 @@ The MCP layer should have small domain adapters rather than returning `InvenTree
 4. Return only the same minimal types in `structuredContent`, when structured output is useful.
 5. Test formatter output with snapshots because formatting is part of the AI-facing API contract.
 
+Console logging should describe semantic MCP activity rather than repeating `POST /mcp`. Log each `tools/call` request with its tool name and arguments so local operators can understand agent activity; suppress initialization, ping, and discovery chatter. Keep HTTP authorization headers and raw bodies out of access logs, redact credential/token-shaped fields and capability URL tokens from semantic logs, and bound individual log entries.
+
 Useful normalized types are approximately:
 
 ```ts

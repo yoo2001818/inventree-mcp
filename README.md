@@ -12,6 +12,7 @@ The service is intentionally self-contained for a single owner:
 - A single server-configured InvenTree URL, with API tokens entered during authorization
 - InvenTree credential validation through `/api/user/me/`
 - HTTP access logs with query strings, headers, and bodies excluded
+- Semantic MCP tool-call logs with tool names and arguments, with credentials and capability tokens redacted
 - AES-256-GCM encryption at rest for the InvenTree token
 - Hashed, short-lived OAuth access tokens and rotating refresh tokens
 - Persistent JSON state designed for one container instance
@@ -145,7 +146,7 @@ The end-to-end test starts a fake InvenTree server and exercises DCR, authorizat
 - MCP requests with an `Origin` header are rejected with HTTP 403 unless the exact origin appears in `ALLOWED_MCP_ORIGINS`.
 - CORS preflights allow the browser headers required by MCP Inspector, including authorization, content type, protocol version, session ID, and event resumption headers.
 - Part images are signature-checked, byte- and pixel-limited, held only in memory for 30 minutes, and uploaded to InvenTree as multipart data only during a confirmed plan commit. Media reads accept only same-origin `/media/` paths returned by the authenticated part API.
-- Access logs include method, pathname, status, response size, and duration. Query parameters, authorization headers, and request bodies are not logged.
+- HTTP access logs include method, pathname, status, response size, and duration, while excluding query parameters, authorization headers, and request bodies. Generic `/mcp` access lines are suppressed; actual `tools/call` requests are logged separately with their tool name and arguments. Password, secret, API-key, OAuth-token, and capability-token fields are redacted, and pathological entries are bounded to 100 KB.
 - DCR accepts only callback origins listed in `ALLOWED_REDIRECT_ORIGINS`; `https://chatgpt.com` is the default.
 - Registrations are rate-limited in memory and capped to prevent unbounded persistent state. For a hardened deployment, also rate-limit at the reverse proxy and optionally restrict the endpoint to OpenAI's published egress ranges.
 - InvenTree tokens are encrypted with AES-256-GCM. OAuth bearer and refresh tokens are stored only as SHA-256 hashes.

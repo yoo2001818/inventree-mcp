@@ -10,6 +10,7 @@ import { DomainError } from "./domainErrors.js";
 import { partImageUploadPage } from "./html.js";
 import { InvenTreeClient } from "./inventree.js";
 import { createMcpServer } from "./mcp.js";
+import { logMcpToolCalls } from "./mcpRequestLogger.js";
 import { inspectImage, PartImageUploads } from "./partImages.js";
 import { OAuthService } from "./oauth.js";
 import { createRequestLogger } from "./requestLogger.js";
@@ -205,6 +206,7 @@ export function createApp(
   });
 
   app.post("/mcp", authenticate, async (req, res) => {
+    logMcpToolCalls(req.body, options.requestLogStream);
     const server = createMcpServer(oauth, imageUploads);
     const transport = new ChatGptStreamableTransport({
       sessionIdGenerator: undefined,
