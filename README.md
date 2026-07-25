@@ -86,6 +86,7 @@ npm run dev
 ```
 
 `npm run dev` loads the Git-ignored `.env` file. Copy `.env.example` to `.env` and set its values if the file does not exist yet.
+It exits immediately when the configured address cannot be bound, including when the port is already occupied. Use `npm run dev:watch` when automatic restarts after file changes are preferred.
 
 For local OAuth testing, `ALLOWED_REDIRECT_ORIGINS` supports the two special loopback patterns `http://localhost:*` and `http://127.0.0.1:*`, allowing Inspector, Codex, and other native clients to choose ephemeral callback ports. No other wildcard forms are accepted. Browser clients still need their exact origin in `ALLOWED_MCP_ORIGINS` for CORS. Local development binds to `127.0.0.1` by default; Docker Compose overrides `BIND_HOST` to `0.0.0.0` inside the container while publishing the port only on host loopback.
 

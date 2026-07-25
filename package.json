@@ -9,7 +9,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx watch --env-file=.env src/index.ts",
+    "dev": "tsx --env-file=.env src/index.ts",
+    "dev:watch": "tsx watch --env-file=.env src/index.ts",
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/**/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

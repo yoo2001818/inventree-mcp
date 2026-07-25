@@ -1,16 +1,11 @@
 import { createApp } from "./app.js";
-import { loadConfig, ownerPasswordFingerprint } from "./config.js";
+import { loadConfig } from "./config.js";
+import { startHttpServer } from "./httpServer.js";
 
 const config = loadConfig();
 const { app } = createApp(config);
 
-const server = app.listen(config.port, config.bindHost, () => {
-  console.log(`InvenTree MCP listening on ${config.bindHost}:${config.port}`);
-  console.log(`Public MCP endpoint: ${config.resourceUrl}`);
-  console.log(
-    `Owner password fingerprint: ${ownerPasswordFingerprint(config)}`,
-  );
-});
+const server = startHttpServer(app, config);
 
 function shutdown(signal: string) {
   console.log(`Received ${signal}; shutting down`);

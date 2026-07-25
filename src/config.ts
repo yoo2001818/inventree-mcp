@@ -112,6 +112,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   };
 }
 
-export function ownerPasswordFingerprint(config: Config): string {
+export function ownerPasswordFingerprint(config: Pick<Config, "ownerPassword">): string {
   return createHash("sha256").update(config.ownerPassword).digest("hex").slice(0, 12);
 }
