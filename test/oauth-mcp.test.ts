@@ -437,6 +437,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       "update_stock_location",
       "print_labels",
       "review_inventory_plan",
+      "open_inventory_plan_review",
       "remove_inventory_plan_step",
       "discard_inventory_plan",
       "commit_inventory_plan",
@@ -456,8 +457,34 @@ describe("OAuth-protected InvenTree MCP", () => {
     ]);
     const stageTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "receive_stock");
     const commitTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "commit_inventory_plan");
+    const extendedReviewTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "open_inventory_plan_review");
     assert.equal(stageTool.annotations.destructiveHint, false);
     assert.equal(commitTool.annotations.destructiveHint, true);
+    assert.equal(extendedReviewTool.annotations.destructiveHint, false);
+    assert.equal(extendedReviewTool._meta.ui.resourceUri, "ui://inventree/inventory-plan-review.html");
+    assert.equal(extendedReviewTool._meta["ui/resourceUri"], "ui://inventree/inventory-plan-review.html");
+
+    const resources = await mcpRequest(token.body.access_token, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "resources/list",
+      params: {},
+    });
+    const reviewResource = resources.body.result.resources.find(
+      (resource: { uri: string }) => resource.uri === "ui://inventree/inventory-plan-review.html",
+    );
+    assert.ok(reviewResource);
+    assert.equal(reviewResource.mimeType, "text/html;profile=mcp-app");
+
+    const appResource = await mcpRequest(token.body.access_token, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "resources/read",
+      params: { uri: "ui://inventree/inventory-plan-review.html" },
+    });
+    assert.equal(appResource.body.result.contents[0].mimeType, "text/html;profile=mcp-app");
+    assert.match(appResource.body.result.contents[0].text, /Inventory plan review/);
+    assert.match(appResource.body.result.contents[0].text, /Commit inventory plan/);
     const createTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "create_part_with_stock");
     const categoryIdSchema = createTool.inputSchema.properties.part.properties.category_id;
     assert.deepEqual(categoryIdSchema.anyOf.map((entry: { type: string }) => entry.type), ["integer", "string"]);
@@ -689,6 +716,20 @@ describe("OAuth-protected InvenTree MCP", () => {
       params: { name: "review_inventory_plan", arguments: { plan_id: planId } },
     });
     assert.equal(review.body.result.structuredContent.data.steps.length, 2);
+
+    const extendedReview = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 221,
+      method: "tools/call",
+      params: { name: "open_inventory_plan_review", arguments: { plan_id: planId } },
+    });
+    assert.equal(extendedReview.body.result.structuredContent.data.plan_version, 2);
+    assert.equal(extendedReview.body.result.structuredContent.data.operation_count, 3);
+    assert.deepEqual(extendedReview.body.result.structuredContent.data.commit, {
+      tool: "commit_inventory_plan",
+      arguments: { plan_id: planId, expected_version: 2 },
+    });
+    assert.match(extendedReview.body.result.content[0].text, /interactive extended-confirmation view/i);
 
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",

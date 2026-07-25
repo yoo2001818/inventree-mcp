@@ -289,3 +289,4 @@ All eight recommendations were implemented in the following pass:
 - only the first staged step repeats append/review guidance;
 - `get_part_image`, expiring upload/download capability URLs, browser and native `PUT` uploads, upload-status checks, `set_part_image`, trusted media downloads, signature and size validation, and multipart commit execution were added without persisting image bytes in plans or capability tokens in access logs.
 - Only relative `/media/` paths are accepted as part images. Static placeholders, absolute URLs, and other namespaces are normalized as no image across part summaries, image retrieval, and replacement previews.
+- `open_inventory_plan_review` provides an optional MCP App for user-requested extended confirmation, including plan details, operation warnings, explicit acknowledgement, and a version-checked commit button, with the full Markdown review retained as a fallback.

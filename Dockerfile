@@ -4,7 +4,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY tsconfig.json tsconfig.build.json ./
+COPY tsconfig.json tsconfig.build.json tsconfig.app.json vite.config.ts ./
+COPY app ./app
 COPY src ./src
 RUN npm run build
 
@@ -16,6 +17,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/dist-app ./dist-app
 
 RUN mkdir -p /data && chown node:node /data
 USER node

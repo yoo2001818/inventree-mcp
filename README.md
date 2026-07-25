@@ -53,6 +53,7 @@ Dedicated write tools append stable steps to a short-lived shared plan. Staging 
 | `create_stock_location` / `update_stock_location` | Organize the physical hierarchy |
 | `print_labels` | Resolve a template and prepare a printer side effect |
 | `review_inventory_plan` | Show the consolidated plan with immutable step IDs and output refs |
+| `open_inventory_plan_review` | Open an optional interactive extended-confirmation app |
 | `remove_inventory_plan_step` | Remove a step, rejecting dependents unless cascade is explicit |
 | `discard_inventory_plan` | Discard temporary plan state without changing InvenTree |
 | `commit_inventory_plan` | Revalidate and commit the once-confirmed plan |
@@ -61,6 +62,8 @@ Dedicated write tools append stable steps to a short-lived shared plan. Staging 
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
 
 Part-image bytes never enter MCP JSON arguments or the persisted plan store. Call `prepare_part_image_upload` to receive an expiring, credential-scoped `upload_ref` and capability URL. A person can open that URL and choose a file, while a native client can `PUT` raw PNG, JPEG, GIF, or extended WebP bytes to the same URL without an OAuth header. The capability token is unguessable, short-lived, and omitted from HTTP access logs. After upload, pass the already-known reference to `set_part_image`, review the shared plan normally, and commit once. For reads, `get_part_image` returns thumbnails and previews immediately as base64 MCP image content; only `variant: "original"` returns a short-lived direct-download URL and MCP resource link. `IMAGE_UPLOAD_MAX_BYTES` and `IMAGE_MAX_PIXELS` configure the in-memory bounds.
+
+When the user explicitly asks for extended or detailed confirmation, call `open_inventory_plan_review(plan_id)` instead of relying only on the Markdown review. MCP Apps-capable hosts render an inline plan UI with every change, outputs, operation counts, a partial-failure warning, an acknowledgement checkbox, and a commit button. The button calls the existing version-checked `commit_inventory_plan`; the app never receives OAuth credentials. Hosts without MCP Apps support still receive the complete Markdown fallback and can use the ordinary confirmation flow.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
 

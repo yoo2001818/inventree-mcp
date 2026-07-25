@@ -618,6 +618,10 @@ Plans execute in their displayed serial order, so a ref may only consume an outp
 
 `review_inventory_plan(plan_id)` is the canonical, consolidated preview. It includes current position, immutable step ID, every material field and side effect, declared outputs, and upstream operation order. This is the first point at which the assistant asks the user to confirm.
 
+If and only if the user asks for extended or detailed confirmation, the assistant may call `open_inventory_plan_review(plan_id)`. This non-destructive tool attaches an MCP App resource while returning the same complete Markdown fallback. The app shows each immutable step, material summary, declared output, upstream operation count, expiry, and the non-transactional execution warning. Its commit button requires an explicit acknowledgement and calls the existing `commit_inventory_plan(plan_id, expected_version)` through the host, so normal ownership, version, stale-state, idempotency, and partial-failure rules remain authoritative. The app receives structured review data but never OAuth credentials or raw internal request bodies.
+
+MCP Apps support is optional and host-dependent. The ordinary `review_inventory_plan` and commit flow remains canonical for routine confirmation and for clients that do not render the `ui://inventree/inventory-plan-review.html` resource.
+
 Plan management is non-destructive:
 
 - `remove_inventory_plan_step(plan_id, step_id, expected_version, cascade=false)` removes an independent step.

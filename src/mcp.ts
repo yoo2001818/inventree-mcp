@@ -4,6 +4,7 @@ import type { OAuthService } from "./oauth.js";
 import type { PartImageUploads } from "./partImages.js";
 import { clientFor, READ_SECURITY, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import { registerReadTools } from "./readTools.js";
+import { registerPlanReviewApp } from "./planReviewApp.js";
 import { registerWriteTools } from "./writeTools.js";
 
 export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUploads): McpServer {
@@ -11,12 +12,13 @@ export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUplo
     { name: "inventree-mcp", version: "0.2.0" },
     {
       instructions:
-        "Home parts and stock only. Stage mutations without confirmation, copy server-issued refs, review once, then commit only after the user confirms.",
+        "Home parts and stock only. Stage mutations without confirmation, copy server-issued refs, review once, then commit only after the user confirms. Use open_inventory_plan_review only when the user asks for extended or detailed confirmation.",
     },
   );
 
   registerReadTools(server, oauth, imageUploads);
   registerWriteTools(server, oauth, imageUploads);
+  registerPlanReviewApp(server, oauth);
 
   server.registerTool(
     "inventree_get",
