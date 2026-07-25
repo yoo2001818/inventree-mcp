@@ -480,6 +480,23 @@ describe("OAuth-protected InvenTree MCP", () => {
     }
     assert.match(planSchema, /"step"/);
     assert.match(planSchema, /"output"/);
+    const outputEnums: unknown[][] = [];
+    const collectOutputEnums = (schema: unknown) => {
+      if (!schema || typeof schema !== "object") return;
+      for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+        if (key === "output" && value && typeof value === "object") {
+          const values = (value as Record<string, unknown>).enum;
+          if (Array.isArray(values)) outputEnums.push(values);
+        }
+        if (Array.isArray(value)) value.forEach(collectOutputEnums);
+        else collectOutputEnums(value);
+      }
+    };
+    collectOutputEnums(stageTool.inputSchema);
+    assert.ok(outputEnums.length > 0, "create_inventory_plan did not publish output-name enums");
+    for (const values of outputEnums) {
+      assert.deepEqual(values, ["part", "stock_item", "part_category", "stock_location"]);
+    }
     const assertPreciseFields = (schema: unknown, path = "inputSchema") => {
       if (!schema || typeof schema !== "object") return;
       const object = schema as Record<string, unknown>;
@@ -771,7 +788,7 @@ describe("OAuth-protected InvenTree MCP", () => {
               action: "print_labels",
               arguments: {
                 entity_type: "stock_item",
-                entities: [{ step: "part", output: "missing_stock" }],
+                entities: [{ step: "part", output: "stock_location" }],
                 template: "30x15mm",
               },
             },
@@ -780,7 +797,46 @@ describe("OAuth-protected InvenTree MCP", () => {
       },
     });
     assert.equal(invalidReference.body.result.structuredContent.data.status, "invalid_plan_reference");
+    assert.equal(invalidReference.body.result.structuredContent.data.reference_error, "unknown_output");
+    assert.equal(invalidReference.body.result.structuredContent.data.supplied_output, "stock_location");
+    assert.deepEqual(invalidReference.body.result.structuredContent.data.available_outputs, ["part"]);
+    assert.match(invalidReference.body.result.content[0].text, /declares outputs \["part"\]/);
     assert.doesNotMatch(readFileSync(config.dataFile, "utf8"), /atomic-invalid-reference/);
+
+    const invalidOutputName = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 35,
+      method: "tools/call",
+      params: {
+        name: "create_inventory_plan",
+        arguments: {
+          operation_id: "atomic-invalid-output-name",
+          steps: [
+            {
+              key: "part",
+              action: "create_part_with_stock",
+              arguments: {
+                part: { name: "New capacitor", category_id: 15 },
+                initial_stock: { quantity: 10, location_id: 81 },
+              },
+            },
+            {
+              key: "label",
+              action: "print_labels",
+              arguments: {
+                entity_type: "stock_item",
+                entities: [{ step: "part", output: "stock_item_id" }],
+                template: "30x15mm",
+              },
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(invalidOutputName.body.result.isError, true);
+    assert.match(invalidOutputName.body.result.content[0].text, /stock_item_id/);
+    assert.match(invalidOutputName.body.result.content[0].text, /part_category/);
+    assert.doesNotMatch(readFileSync(config.dataFile, "utf8"), /atomic-invalid-output-name/);
   });
 
   it("accepts numeric ID strings, resolves refs in request paths, and enforces counted tree depth", async () => {

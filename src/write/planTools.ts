@@ -28,7 +28,10 @@ const PLAN_ACTION_GUIDE = [
   "set_stock_status {stock_item_ids,status,notes?}; create_part_category {name,parent_id?,...};",
   "update_part_category {category_id,changes}; create_stock_location {name,parent_id?,...};",
   "update_stock_location {location_id,changes}; print_labels {entity_type,entities,template,printer?,copies?}.",
-  "Later entity fields may use {step:\"earlier_key\",output:\"declared_output\"}.",
+  "Exact outputs (never append _id): create_part_with_stock -> part, plus stock_item only with initial_stock;",
+  "receive_stock -> stock_item only when it creates a new item (use merge:new_item when a later step requires it);",
+  "create_part_category -> part_category; create_stock_location -> stock_location; all other actions -> no outputs.",
+  "Reference example: {step:\"part\",output:\"stock_item\"}, where step is the exact earlier step key.",
 ].join(" ");
 
 function primitiveArgumentsShape(definition: PrimitiveDefinition): z.ZodRawShape {
@@ -47,11 +50,34 @@ function resolveLocalPlanRefs(
   if (keys.length === 2 && keys.includes("step") && keys.includes("output")) {
     const step = String(object.step);
     const output = String(object.output);
-    const ref = aliases.get(step)?.get(output);
-    if (!ref) {
+    const available = aliases.get(step);
+    if (!available) {
       throw new DomainError(
-        { status: "invalid_plan_reference", step, output },
-        `Unknown or forward local plan reference ${step}.${output}; references must name an output from an earlier step`,
+        {
+          status: "invalid_plan_reference",
+          reference_error: "unknown_or_forward_step",
+          step,
+          supplied_output: output,
+          available_outputs: [],
+        },
+        `Step "${step}" is unknown, skipped, or not earlier in the plan; step must be the exact key of an earlier step`,
+      );
+    }
+    const ref = available.get(output);
+    if (!ref) {
+      const availableOutputs = [...available.keys()];
+      const choices = availableOutputs.length
+        ? `declares outputs ${JSON.stringify(availableOutputs)}`
+        : "declares no outputs";
+      throw new DomainError(
+        {
+          status: "invalid_plan_reference",
+          reference_error: "unknown_output",
+          step,
+          supplied_output: output,
+          available_outputs: availableOutputs,
+        },
+        `Step "${step}" ${choices}; output "${output}" is not valid. Use an exact declared output name and never append _id.`,
       );
     }
     return ref;

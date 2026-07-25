@@ -25,10 +25,13 @@ import type {
 } from "../store.js";
 export const positiveQuantity = z.number().positive().finite();
 export const optionalText = () => z.string().max(50_000).nullable().optional();
+export const localPlanOutputNames = ["part", "stock_item", "part_category", "stock_location"] as const;
 export const localPlanRefSchema = z.object({
-  step: z.string().min(1).max(64),
-  output: z.string().min(1).max(64),
-}).strict().describe("Output of an earlier step in this create_inventory_plan request");
+  step: z.string().min(1).max(64).describe("Exact key of an earlier step in this create_inventory_plan request"),
+  output: z.enum(localPlanOutputNames).describe(
+    "Exact declared output name. Use part, stock_item, part_category, or stock_location; never append _id.",
+  ),
+}).strict().describe("Reference to an entity output declared by an earlier step");
 export const partUnitsSchema = z.string().trim().min(1).max(20).nullable().optional().describe(
   "Formal InvenTree unit such as m, kg, L, piece, each, dozen, hundred, or thousand. Omit unless the user explicitly specifies a unit; never use arbitrary nouns, localized counting words, or packaging.",
 );
@@ -45,7 +48,8 @@ export const planInputFields = {
 };
 export const entitySelectorSchema = entityIdSchema();
 
-export type LocalPlanRef = { step: string; output: string };
+export type LocalPlanOutputName = typeof localPlanOutputNames[number];
+export type LocalPlanRef = { step: string; output: LocalPlanOutputName };
 export type PlanInput = { plan_id?: string; expected_version?: number; operation_id: string };
 export type EntityId = number | string | LocalPlanRef;
 

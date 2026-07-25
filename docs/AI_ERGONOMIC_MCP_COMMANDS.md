@@ -591,6 +591,8 @@ Some MCP clients preserve the complete JSON Schema but render a large nested act
 - Action arguments never contain `plan_id`, `expected_version`, or their own `operation_id`.
 - Step keys are unique, short request-local identifiers.
 - Steps execute in array order and may reference only earlier outputs.
+- `step` is the exact `key` of an earlier step. `output` is an exact semantic entity name, never an `_id` field: `part`, `stock_item`, `part_category`, or `stock_location`.
+- `create_part_with_stock` declares `part` and declares `stock_item` only when `initial_stock` is present. `receive_stock` declares `stock_item` only when it creates a new stock item; use `merge: "new_item"` when a later step requires that output. `create_part_category` declares `part_category`, and `create_stock_location` declares `stock_location`. Other actions declare no outputs.
 - Every action is validated using the same private compiler used for single-step plans.
 - If any action fails validation, the server discards temporary staged state and returns no usable plan.
 - Steps that prove already current may be listed in `skipped_steps`; if every step is already current, no plan is created.
@@ -725,6 +727,8 @@ Tools should return actionable domain outcomes rather than raw HTTP errors:
 Expected domain failures should not dump a serializer or stack trace. Authentication and scope failures should continue to use MCP authorization metadata.
 
 Expected errors use the same `structuredContent.data` envelope as successes. Plan-version conflicts include `expected_version` and `current_version`; dependency conflicts include `dependent_step_ids`; possible duplicates include compact `{id, name}` candidates; missing entities include their supplied ID and suggested lookup tool. Unknown barcode errors never echo an upstream barcode hash or the supplied barcode.
+
+Invalid local references include `supplied_output` and `available_outputs`. If the referenced step exists, canonical text lists its exact declared output names and reminds the caller never to append `_id`.
 
 ## Pagination and output limits
 
