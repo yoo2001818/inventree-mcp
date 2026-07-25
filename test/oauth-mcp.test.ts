@@ -14,6 +14,61 @@ import { pkceS256 } from "../src/crypto.js";
 describe("OAuth-protected InvenTree MCP", () => {
   const directory = mkdtempSync(join(tmpdir(), "inventree-mcp-test-"));
   const fakeInvenTree = express();
+  fakeInvenTree.use(express.json());
+  const category = {
+    pk: 15,
+    name: "Resistors",
+    pathstring: "Electronics/Resistors",
+    parent: 13,
+    level: 1,
+    structural: false,
+    subcategories: 0,
+    part_count: 1,
+  };
+  const location = {
+    pk: 81,
+    name: "Drawer A3",
+    pathstring: "Living room/Blue cabinet/Drawer A3",
+    parent: 22,
+    level: 2,
+    structural: false,
+    sublocations: 0,
+    items: 1,
+  };
+  const part = {
+    pk: 42,
+    name: "10k resistor",
+    description: "1%, 0603",
+    IPN: "R-10K",
+    category: 15,
+    category_name: "Resistors",
+    category_detail: category,
+    default_location: 81,
+    default_location_detail: location,
+    active: true,
+    locked: false,
+    trackable: false,
+    units: "pcs",
+    minimum_stock: 50,
+    total_in_stock: 200,
+  };
+  const stockItem = {
+    pk: 91,
+    part: 42,
+    part_detail: part,
+    quantity: 200,
+    allocated: 0,
+    location: 81,
+    location_detail: location,
+    status: 10,
+    status_text: "OK",
+    expired: false,
+    batch: "",
+    packaging: "",
+    expiry_date: null,
+    updated: "2026-01-01 00:00",
+    in_stock: true,
+  };
   fakeInvenTree.use((req, res, next) => {
     if (req.header("authorization") !== "Token correct-inventree-token") {
       res.status(401).json({ detail: "Invalid token" });
@@ -22,14 +77,33 @@ describe("OAuth-protected InvenTree MCP", () => {
     next();
   });
   fakeInvenTree.get("/api/user/me/", (_req, res) => res.json({ pk: 1, username: "workbench" }));
+  fakeInvenTree.get("/api/part/category/tree/", (_req, res) =>
+    res.json({ count: 1, next: null, previous: null, results: [category] }),
+  );
+  fakeInvenTree.get("/api/part/category/:id/", (_req, res) => res.json(category));
+  fakeInvenTree.get("/api/stock/location/tree/", (_req, res) =>
+    res.json({ count: 1, next: null, previous: null, results: [location] }),
+  );
+  fakeInvenTree.get("/api/stock/location/:id/", (_req, res) => res.json(location));
+  fakeInvenTree.get("/api/part/:id/", (_req, res) => res.json(part));
   fakeInvenTree.get("/api/part/", (req, res) =>
     res.json({
       count: 1,
       next: null,
       previous: null,
-      results: [{ pk: 42, name: "10k resistor", IPN: "R-10K", query: req.query.search }],
+      results: [{ ...part, query: req.query.search }],
     }),
   );
+  fakeInvenTree.get("/api/stock/:id/", (_req, res) => res.json(stockItem));
+  fakeInvenTree.get("/api/stock/", (_req, res) =>
+    res.json({ count: 1, next: null, previous: null, results: [stockItem] }),
+  );
+  fakeInvenTree.post("/api/stock/add/", (req, res) => {
+    const adjustment = req.body.items?.[0];
+    stockItem.quantity += Number(adjustment?.quantity ?? 0);
+    part.total_in_stock = stockItem.quantity;
+    res.status(201).json(req.body);
+  });
   const upstreamServer = createServer(fakeInvenTree);
   let upstreamUrl = "";
   let app: ReturnType<typeof createApp>["app"];
@@ -52,6 +126,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       "http://127.0.0.1:*",
     ],
     allowedMcpOrigins: ["https://chatgpt.com"],
+    enableRawWrite: false,
   };
 
   before(async () => {
@@ -248,7 +323,36 @@ describe("OAuth-protected InvenTree MCP", () => {
       method: "tools/list",
       params: {},
     });
-    const searchTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "search_parts");
+    const toolNames = tools.body.result.tools.map((tool: { name: string }) => tool.name);
+    for (const expected of [
+      "browse_part_categories",
+      "browse_stock_locations",
+      "find_parts",
+      "get_part_inventory",
+      "inventory_at_location",
+      "check_stock_levels",
+      "get_stock_history",
+      "scan_barcode",
+      "create_part_with_stock",
+      "update_part",
+      "receive_stock",
+      "consume_stock",
+      "move_stock",
+      "count_stock",
+      "set_stock_status",
+      "create_part_category",
+      "update_part_category",
+      "create_stock_location",
+      "update_stock_location",
+      "print_labels",
+      "commit_inventory_change",
+      "inventree_get",
+    ]) {
+      assert.ok(toolNames.includes(expected), `missing tool ${expected}`);
+    }
+    assert.ok(!toolNames.includes("inventree_write"));
+    assert.ok(!toolNames.includes("get_part_bom"));
+    const searchTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "find_parts");
     assert.ok(searchTool);
     assert.deepEqual(searchTool._meta.securitySchemes, [
       { type: "oauth2", scopes: ["inventree.read"] },
@@ -261,22 +365,22 @@ describe("OAuth-protected InvenTree MCP", () => {
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: { name: "search_parts", arguments: { query: "10k" } },
+      params: { name: "find_parts", arguments: { query: "10k" } },
     });
-    assert.equal(search.body.result.structuredContent.data.results[0].pk, 42);
-    assert.equal(search.body.result.structuredContent.data.results[0].query, "10k");
+    assert.equal(search.body.result.structuredContent.data.results[0].id, 42);
+    assert.equal(search.body.result.structuredContent.data.results[0].placements[0].stockItemId, 91);
+    assert.match(search.body.result.content[0].text, /Drawer A3 \(#81\)/);
 
     const refusedWrite = await mcpRequest(token.body.access_token, {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
       params: {
-        name: "inventree_write",
+        name: "receive_stock",
         arguments: {
-          method: "PATCH",
-          path: "/api/part/42/",
-          body: { description: "changed" },
-          confirmation: "I confirm this InvenTree mutation",
+          part_id: 42,
+          quantity: 1,
+          location_id: 81,
         },
       },
     });
@@ -298,6 +402,120 @@ describe("OAuth-protected InvenTree MCP", () => {
       .expect(200);
     assert.notEqual(refresh.body.refresh_token, token.body.refresh_token);
   });
+
+  it("previews, revalidates, and commits a dedicated stock workflow exactly once", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+
+    const preview = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: "receive_stock",
+        arguments: {
+          part_id: 42,
+          quantity: 5,
+          location_id: 81,
+          merge: "compatible",
+          notes: "Integration test",
+        },
+      },
+    });
+    assert.equal(preview.body.result.structuredContent.status, "confirmation_required");
+    assert.match(preview.body.result.content[0].text, /200 pcs -> 205 pcs/);
+    const planId = preview.body.result.structuredContent.plan_id as string;
+
+    const commit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "commit_inventory_change", arguments: { plan_id: planId } },
+    });
+    assert.equal(commit.body.result.structuredContent.data.status, "committed");
+    assert.equal(stockItem.quantity, 205);
+
+    const replay = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "commit_inventory_change", arguments: { plan_id: planId } },
+    });
+    assert.equal(replay.body.result.isError, true);
+    assert.match(replay.body.result.content[0].text, /not found, expired, or already used/);
+    assert.equal(stockItem.quantity, 205);
+
+    const stalePreview = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: {
+        name: "receive_stock",
+        arguments: { part_id: 42, quantity: 1, location_id: 81, merge: "compatible" },
+      },
+    });
+    const stalePlanId = stalePreview.body.result.structuredContent.plan_id as string;
+    stockItem.quantity = 206;
+    part.total_in_stock = 206;
+    const staleCommit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 14,
+      method: "tools/call",
+      params: { name: "commit_inventory_change", arguments: { plan_id: stalePlanId } },
+    });
+    assert.equal(staleCommit.body.result.isError, true);
+    assert.match(staleCommit.body.result.content[0].text, /plan is stale/);
+    assert.equal(stockItem.quantity, 206);
+  });
+
+  async function authorizeToken(scope: string): Promise<string> {
+    const redirectUri = "https://chatgpt.com/connector/oauth/workflow-test";
+    const registration = await request(app)
+      .post("/oauth/register")
+      .send({ client_name: "Workflow test", redirect_uris: [redirectUri] })
+      .expect(201);
+    const clientId = registration.body.client_id as string;
+    const verifier = "workflow-test-verifier-with-enough-entropy-01234567890";
+    const authorization = await request(app)
+      .get("/oauth/authorize")
+      .query({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        scope,
+        resource: config.resourceUrl,
+        code_challenge: pkceS256(verifier),
+        code_challenge_method: "S256",
+      })
+      .expect(200);
+    const requestId = /name="request_id" value="([^"]+)"/.exec(authorization.text)?.[1];
+    assert.ok(requestId);
+    const approval = await request(app)
+      .post("/oauth/authorize")
+      .type("form")
+      .send({
+        request_id: requestId,
+        api_token: "correct-inventree-token",
+        owner_password: config.ownerPassword,
+      })
+      .expect(303);
+    const callbackLocation = approval.header.location;
+    assert.ok(callbackLocation);
+    const code = new URL(callbackLocation).searchParams.get("code");
+    assert.ok(code);
+    const token = await request(app)
+      .post("/oauth/token")
+      .type("form")
+      .send({
+        grant_type: "authorization_code",
+        code,
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+        resource: config.resourceUrl,
+      })
+      .expect(200);
+    return token.body.access_token as string;
+  }
 
   async function mcpRequest(accessToken: string, body: object) {
     return request(app)

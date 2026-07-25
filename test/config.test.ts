@@ -21,6 +21,7 @@ describe("configuration", () => {
       "http://127.0.0.1:*",
     ]);
     assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com"]);
+    assert.equal(config.enableRawWrite, false);
   });
 
   it("loads explicit bind and MCP Origin settings", () => {
@@ -32,6 +33,11 @@ describe("configuration", () => {
 
     assert.equal(config.bindHost, "0.0.0.0");
     assert.deepEqual(config.allowedMcpOrigins, ["https://chatgpt.com", "http://localhost:6274"]);
+  });
+
+  it("only enables the raw write escape hatch explicitly", () => {
+    assert.equal(loadConfig({ ...validEnvironment, ENABLE_RAW_WRITE: "true" }).enableRawWrite, true);
+    assert.equal(loadConfig({ ...validEnvironment, ENABLE_RAW_WRITE: "false" }).enableRawWrite, false);
   });
 
   it("requires the fixed InvenTree URL", () => {

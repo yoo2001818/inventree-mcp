@@ -14,6 +14,7 @@ export interface Config {
   refreshTokenTtlSeconds: number;
   allowedRedirectOrigins: string[];
   allowedMcpOrigins: string[];
+  enableRawWrite: boolean;
 }
 
 function required(name: string, value: string | undefined): string {
@@ -109,6 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "ALLOWED_MCP_ORIGINS",
       env.ALLOWED_MCP_ORIGINS ?? "https://chatgpt.com",
     ),
+    enableRawWrite: env.ENABLE_RAW_WRITE?.trim().toLowerCase() === "true",
   };
 }
 

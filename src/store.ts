@@ -47,7 +47,29 @@ export interface StoredRefreshToken extends Omit<StoredAccessToken, "tokenHash">
   tokenHash: string;
 }
 
-interface StoreData {
+export interface MutationRequest {
+  method: "POST" | "PATCH" | "PUT";
+  path: string;
+  body: unknown;
+}
+
+export interface MutationCheck {
+  path: string;
+  query?: Record<string, unknown>;
+  digest: string;
+}
+
+export interface MutationPlan {
+  id: string;
+  credentialsId: string;
+  summary: string;
+  requests: MutationRequest[];
+  checks: MutationCheck[];
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface StoreData {
   version: 1;
   clients: Record<string, OAuthClient>;
   pendingAuthorizations: Record<string, PendingAuthorization>;
@@ -55,6 +77,7 @@ interface StoreData {
   credentials: Record<string, StoredCredentials>;
   accessTokens: Record<string, StoredAccessToken>;
   refreshTokens: Record<string, StoredRefreshToken>;
+  mutationPlans: Record<string, MutationPlan>;
 }
 
 function emptyStore(): StoreData {
@@ -66,6 +89,7 @@ function emptyStore(): StoreData {
     credentials: {},
     accessTokens: {},
     refreshTokens: {},
+    mutationPlans: {},
   };
 }
 
@@ -76,6 +100,7 @@ export class JsonStore {
     mkdirSync(dirname(file), { recursive: true });
     try {
       this.data = JSON.parse(readFileSync(file, "utf8")) as StoreData;
+      this.data.mutationPlans ??= {};
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.data = emptyStore();
@@ -100,6 +125,7 @@ export class JsonStore {
         data.authorizationCodes,
         data.accessTokens,
         data.refreshTokens,
+        data.mutationPlans,
       ]) {
         for (const [key, value] of Object.entries(collection)) {
           if (value.expiresAt <= now) delete collection[key];
