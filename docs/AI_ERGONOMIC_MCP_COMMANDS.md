@@ -177,6 +177,8 @@ Suggested input:
 
 `stock` should be `any`, `in_stock`, `depleted`, or `below_minimum`. Search the part endpoint, then fetch or aggregate stock only for returned part IDs. Do not return the full nested `Part` and `StockItem` serializers.
 
+Normalize common resistance spellings before searching so conversational forms such as `10 kOhm`, `10 kΩ`, `10kohm`, and `10 kiloohm` match the compact InvenTree form `10kΩ`. Preserve SI prefix case where it changes meaning, such as `mΩ` versus `MΩ`.
+
 Canonical output:
 
 ```markdown
@@ -583,6 +585,8 @@ Ref substitution applies to both request bodies and entity IDs embedded in reque
   ]
 }
 ```
+
+Some MCP clients preserve the complete JSON Schema but render a large nested action union as `unknown` in their generated language declaration. Keep the strict discriminated union as the authoritative validation schema, and include a compact action-to-arguments guide in the tool description so an agent can still construct the request without repository documentation.
 
 - Action arguments never contain `plan_id`, `expected_version`, or their own `operation_id`.
 - Step keys are unique, short request-local identifiers.

@@ -10,8 +10,7 @@ export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUplo
   const server = new McpServer(
     { name: "inventree-mcp", version: "0.3.0" },
     {
-      instructions:
-        "Home parts and stock only. Put the complete ordered mutation workflow in one create_inventory_plan call, using {step, output} for dependencies. Its response is the canonical review; commit only after one user confirmation.",
+      instructions: "Home parts and physical stock only.",
     },
   );
 

@@ -76,6 +76,7 @@ describe("OAuth-protected InvenTree MCP", () => {
   const patchedLocationIds: string[] = [];
   const transferredStockBodies: unknown[] = [];
   const partImagePatches: Array<{ contentType: string; body: Buffer }> = [];
+  const partSearchQueries: string[] = [];
   fakeInvenTree.use((req, res, next) => {
     if (req.header("authorization") !== "Token correct-inventree-token") {
       res.status(401).json({ detail: "Invalid token" });
@@ -136,6 +137,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     return res.json(part);
   });
   fakeInvenTree.get("/api/part/", (req, res) => {
+    partSearchQueries.push(String(req.query.search ?? ""));
     const results = req.query.search === "New capacitor" ? [] : [{ ...part, query: req.query.search }];
     res.json({ count: results.length, next: null, previous: null, results });
   });
@@ -464,6 +466,10 @@ describe("OAuth-protected InvenTree MCP", () => {
     const commitTool = tools.body.result.tools.find((tool: { name: string }) => tool.name === "commit_inventory_plan");
     assert.equal(stageTool.annotations.destructiveHint, false);
     assert.equal(commitTool.annotations.destructiveHint, true);
+    const stepsDescription = stageTool.inputSchema.properties.steps.description as string;
+    assert.match(stepsDescription, /Step shape: \{key, action, arguments\}/);
+    assert.match(stepsDescription, /receive_stock \{part_id,quantity,location_id/);
+    assert.match(stepsDescription, /print_labels \{entity_type,entities,template/);
     const planSchema = JSON.stringify(stageTool.inputSchema);
     for (const action of [
       "create_part_with_stock", "update_part", "set_part_image", "receive_stock", "consume_stock",
@@ -504,6 +510,14 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.equal(search.body.result.structuredContent.data.results[0].placements[0].expired, undefined);
     assert.equal(search.body.result.structuredContent.data.results[0].placements[0].status, undefined);
     assert.match(search.body.result.content[0].text, /Drawer A3 \(#81\)/);
+    const normalizedSearch = await mcpRequest(token.body.access_token, {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: { name: "find_parts", arguments: { query: "10 kOhm resistor" } },
+    });
+    assert.equal(normalizedSearch.body.result.structuredContent.data.results[0].id, 42);
+    assert.equal(partSearchQueries.at(-1), "10kΩ resistor");
     const toolLog = requestLogs.find((message) => message.includes("MCP tools/call") && message.includes('"name":"find_parts"'));
     assert.ok(toolLog);
     assert.match(toolLog, /"arguments":\{"query":"10k"/);
@@ -716,6 +730,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       method: "tools/call",
       params: { name: "review_inventory_plan", arguments: { plan_id: planId } },
     });
+    assert.equal(review.body.result.structuredContent.data.status, "staged");
     assert.equal(review.body.result.structuredContent.data.steps.length, 2);
 
     const printRequestCountBeforeCommit = printedLabelBodies.length;
@@ -1020,8 +1035,9 @@ describe("OAuth-protected InvenTree MCP", () => {
       status: "not_found",
       entity_type: "part_image",
       supplied_id: 43,
-      suggested_tool: "create_inventory_plan",
+      suggested_tool: "prepare_part_image_upload",
     });
+    assert.match(noImage.body.result.content[0].text, /prepare_part_image_upload/);
 
     const image = await mcpRequest(accessToken, {
       jsonrpc: "2.0",

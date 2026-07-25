@@ -7,6 +7,7 @@ import {
   formatPartSearch,
   formatTree,
   normalizePart,
+  normalizePartSearchQuery,
   page,
   partImagePath,
 } from "../src/inventoryDomain.js";
@@ -50,6 +51,28 @@ describe("AI-facing inventory formatting", () => {
     assert.match(text, /Electronics > Resistors \(#15\)/);
     assert.match(text, /Living room > Drawer A3 \(#81\): 200 pcs \[stock #991\]/);
     assert.doesNotMatch(text, /pricing|purchase|assembly/);
+  });
+
+  it("normalizes conversational resistance values for InvenTree search", () => {
+    for (const query of ["10 kOhm resistor", "10 kΩ resistor", "10kohm resistor", "10 kiloohm resistor"]) {
+      assert.equal(normalizePartSearchQuery(query), "10kΩ resistor");
+    }
+    assert.equal(normalizePartSearchQuery("4,7 megaohms"), "4.7MΩ");
+    assert.equal(normalizePartSearchQuery("10 mΩ shunt"), "10mΩ shunt");
+    assert.equal(normalizePartSearchQuery("1 MOhm resistor"), "1MΩ resistor");
+    assert.equal(normalizePartSearchQuery("precision resistor"), "precision resistor");
+  });
+
+  it("uses absolute item numbers on subsequent part-search pages", () => {
+    const summaries = [
+      { id: 1, name: "First", totalQuantity: 1 },
+      { id: 2, name: "Second", totalQuantity: 1 },
+    ];
+    const text = formatPartSearch(page({ count: 15 }, summaries, 5));
+
+    assert.match(text, /^Results 6-7 of 15 parts:/);
+    assert.match(text, /^6\. First/m);
+    assert.match(text, /^7\. Second/m);
   });
 
   it("does not treat InvenTree's blank thumbnail sentinel as a part image", () => {

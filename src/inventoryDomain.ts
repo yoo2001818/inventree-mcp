@@ -68,6 +68,28 @@ export function optionalString(value: unknown): string | undefined {
   return text || undefined;
 }
 
+export function normalizePartSearchQuery(value: string): string {
+  return value
+    .trim()
+    .replace(
+      /(\d+(?:[.,]\d+)?)\s*(k(?:ilo)?|m(?:ega|illi)?|g(?:iga)?)?\s*(?:ohms?|Ω|Ω)/giu,
+      (_match, magnitude: string, prefix: string | undefined) => {
+        const lowerPrefix = prefix?.toLowerCase();
+        const normalizedPrefix = prefix === "m" || lowerPrefix === "milli"
+          ? "m"
+          : lowerPrefix === "k" || lowerPrefix === "kilo"
+            ? "k"
+            : lowerPrefix === "m" || lowerPrefix === "mega"
+              ? "M"
+              : lowerPrefix === "g" || lowerPrefix === "giga"
+                ? "G"
+                : "";
+        return `${magnitude.replace(",", ".")}${normalizedPrefix}Ω`;
+      },
+    )
+    .replace(/\s+/g, " ");
+}
+
 export function partImagePath(value: unknown): string | undefined {
   const path = optionalString(value);
   if (!path?.startsWith("/media/") || path.includes("?") || path.includes("#")) return undefined;
@@ -218,7 +240,7 @@ export function formatPartSearch(resultPage: Page<PartSummary>): string {
   const lines = [`Results ${first}-${last} of ${resultPage.count} part${resultPage.count === 1 ? "" : "s"}:`, ""];
   resultPage.results.forEach((part, index) => {
     lines.push(
-      `${index + 1}. ${part.name} (#${part.id}) — ${
+      `${resultPage.offset + index + 1}. ${part.name} (#${part.id}) — ${
         part.totalQuantity > 0 ? `${formatQuantity(part.totalQuantity, part.units)} total` : "out of stock"
       }`,
     );

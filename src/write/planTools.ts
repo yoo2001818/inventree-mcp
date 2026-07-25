@@ -18,6 +18,19 @@ import {
   type PrimitiveDefinition,
 } from "./shared.js";
 
+const PLAN_ACTION_GUIDE = [
+  "Step shape: {key, action, arguments}. Action argument guide:",
+  "create_part_with_stock {part:{name,category_id,...}, initial_stock?}; update_part {part_id,changes};",
+  "set_part_image {part_id,upload_ref}; receive_stock {part_id,quantity,location_id,...};",
+  "consume_stock {part_id,quantity,location_id?,stock_item_id?,strategy?,reason?,notes?};",
+  "move_stock {destination_location_id plus stock_item_id, part_id/source_location_id, or source_location_id/all};",
+  "count_stock {counts:[{stock_item_id,observed_quantity}],location_id?,notes?};",
+  "set_stock_status {stock_item_ids,status,notes?}; create_part_category {name,parent_id?,...};",
+  "update_part_category {category_id,changes}; create_stock_location {name,parent_id?,...};",
+  "update_stock_location {location_id,changes}; print_labels {entity_type,entities,template,printer?,copies?}.",
+  "Later entity fields may use {step:\"earlier_key\",output:\"declared_output\"}.",
+].join(" ");
+
 function primitiveArgumentsShape(definition: PrimitiveDefinition): z.ZodRawShape {
   const { plan_id: _planId, expected_version: _expectedVersion, operation_id: _operationId, ...shape } = definition.config.inputSchema;
   return shape;
@@ -82,23 +95,25 @@ function registerCreateInventoryPlan(
   }).strict().describe(definition.config.description));
   if (variants.length < 2) throw new Error("create_inventory_plan requires at least two mutation primitives");
   const stepSchema = z.union(variants as unknown as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
-  const stepsSchema = z.array(stepSchema).min(1).max(30).superRefine((steps, context) => {
-    const seen = new Set<string>();
-    for (const [index, step] of steps.entries()) {
-      const key = String((step as { key: string }).key);
-      if (seen.has(key)) {
-        context.addIssue({ code: z.ZodIssueCode.custom, message: `Duplicate step key: ${key}`, path: [index, "key"] });
+  const stepsSchema = z.array(stepSchema).min(1).max(30)
+    .superRefine((steps, context) => {
+      const seen = new Set<string>();
+      for (const [index, step] of steps.entries()) {
+        const key = String((step as { key: string }).key);
+        if (seen.has(key)) {
+          context.addIssue({ code: z.ZodIssueCode.custom, message: `Duplicate step key: ${key}`, path: [index, "key"] });
+        }
+        seen.add(key);
       }
-      seen.add(key);
-    }
-  });
+    })
+    .describe(PLAN_ACTION_GUIDE);
 
   server.registerTool(
     "create_inventory_plan",
     {
       title: "Create a complete inventory mutation plan",
       description:
-        "Validate and stage an entire ordered inventory workflow in one call. Use request-local step keys and {step, output} references for dependencies. The response is the complete canonical review; ask once for confirmation, then call commit_inventory_plan.",
+        "Validate and stage an entire ordered inventory workflow in one call. The steps parameter documents every action shape for clients that render its strict union opaquely. The response is the complete canonical review; ask once for confirmation, then call commit_inventory_plan.",
       inputSchema: {
         operation_id: z.string().min(1).max(100).describe("Caller-stable idempotency key for the complete plan"),
         steps: stepsSchema,
@@ -224,7 +239,7 @@ export function registerInventoryPlanTools(
         const reviewed = reviewPlan(oauth, auth, plan_id);
         return result(
           {
-            status: reviewed.plan.state,
+            status: reviewed.plan.state === "staging" ? "staged" : reviewed.plan.state,
             plan_id,
             plan_version: reviewed.plan.version,
             steps: reviewed.plan.steps.map((step, index) => ({

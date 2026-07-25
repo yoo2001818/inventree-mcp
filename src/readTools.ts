@@ -12,6 +12,7 @@ import {
   formatRef,
   formatTree,
   normalizePart,
+  normalizePartSearchQuery,
   normalizeStock,
   numberValue,
   optionalString,
@@ -316,8 +317,9 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
       safely(oauth, async () => {
         const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
         const offset = decodeCursor(input.cursor);
+        const normalizedQuery = normalizePartSearchQuery(input.query);
         const data = await client.get("/api/part/", {
-          search: input.query,
+          search: normalizedQuery,
           category: input.category_id,
           cascade: input.category_id ? input.include_subcategories : undefined,
           active: input.active,
@@ -395,8 +397,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
           throw notFound(
             "part_image",
             { supplied_id: input.part_id },
-            "create_inventory_plan",
-            `Part #${input.part_id} does not have an image. Upload one, then create a plan containing a set_part_image action.`,
+            "prepare_part_image_upload",
+            `Part #${input.part_id} does not have an image. Call prepare_part_image_upload, upload the image, then create a plan containing a set_part_image action.`,
           );
         }
         const name = optionalString(part.name) ?? `Part ${input.part_id}`;
