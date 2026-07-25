@@ -8,7 +8,7 @@ The service is intentionally self-contained for a single owner:
 - OAuth 2.1 authorization-code flow with S256 PKCE
 - Dynamic client registration (DCR) for ChatGPT
 - OAuth protected-resource and authorization-server discovery
-- Authorization page where the owner enters an InvenTree URL and API token
+- A single server-configured InvenTree URL, with API tokens entered during authorization
 - InvenTree credential validation through `/api/user/me/`
 - AES-256-GCM encryption at rest for the InvenTree token
 - Hashed, short-lived OAuth access tokens and rotating refresh tokens
@@ -44,7 +44,7 @@ openssl rand -base64 32  # use as ENCRYPTION_KEY
 openssl rand -base64 32  # use as OWNER_PASSWORD
 ```
 
-Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
+Set `PUBLIC_URL` to the external origin only, such as `https://inventree-mcp.example.com`. Do not include `/mcp`. Set `INVENTREE_URL` to the one InvenTree instance reachable from the bridge container, such as `http://inventree-server:8000`. End users cannot override this URL; changing it and restarting the service moves all existing credential links to the new instance. Keep `ENCRYPTION_KEY` stable: changing it makes previously linked InvenTree credentials unreadable.
 
 Start the service:
 
@@ -70,7 +70,6 @@ Back up the `inventree-mcp-data` volume together with the encryption key. Run on
 3. Open **Settings → Plugins**, add a developer-mode app, and enter `https://inventree-mcp.example.com/mcp`.
 4. Choose dynamic client registration when ChatGPT asks how to register the OAuth client.
 5. On the authorization page, enter:
-   - An InvenTree URL reachable from the bridge container. It may be private, such as `http://inventree-server:8000`; ChatGPT never connects to it directly.
    - A dedicated InvenTree API token.
    - `OWNER_PASSWORD` from the deployment environment.
 6. Start a new Work conversation, enable the app, and try: “Find my 10 kΩ resistors and tell me where they are.”
@@ -82,6 +81,7 @@ ChatGPT's current MCP authorization flow expects protected-resource metadata, OA
 ```bash
 npm install
 PUBLIC_URL=http://localhost:3000 \
+INVENTREE_URL=http://localhost:8000 \
 ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 OWNER_PASSWORD="$(openssl rand -base64 32)" \
 DATA_FILE=./data/state.json \
@@ -104,6 +104,7 @@ The end-to-end test starts a fake InvenTree server and exercises DCR, authorizat
 
 - This is a compact single-user authorization server, not a general identity platform.
 - `OWNER_PASSWORD` gates authorization and is rate-limited in memory after failed attempts.
+- `INVENTREE_URL` fixes the upstream instance for every linked credential; authorization requests cannot select another host.
 - DCR accepts only callback origins listed in `ALLOWED_REDIRECT_ORIGINS`; `https://chatgpt.com` is the default.
 - Registrations are rate-limited in memory and capped to prevent unbounded persistent state. For a hardened deployment, also rate-limit at the reverse proxy and optionally restrict the endpoint to OpenAI's published egress ranges.
 - InvenTree tokens are encrypted with AES-256-GCM. OAuth bearer and refresh tokens are stored only as SHA-256 hashes.

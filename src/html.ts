@@ -12,7 +12,6 @@ export function authorizationPage(input: {
   clientName: string;
   scopes: string[];
   error?: string;
-  inventreeUrl?: string;
 }): string {
   const scopeItems = input.scopes.map((scope) => `<li>${escapeHtml(scope)}</li>`).join("");
   const error = input.error ? `<div class="error">${escapeHtml(input.error)}</div>` : "";
@@ -43,8 +42,6 @@ export function authorizationPage(input: {
   <p>Requested permissions:</p><ul>${scopeItems}</ul>
   <form method="post" action="/oauth/authorize" autocomplete="off">
     <input type="hidden" name="request_id" value="${escapeHtml(input.requestId)}">
-    <label for="inventree_url">InvenTree URL</label>
-    <input id="inventree_url" name="inventree_url" type="url" required placeholder="https://inventree.example.com" value="${escapeHtml(input.inventreeUrl ?? "")}">
     <label for="api_token">InvenTree API token</label>
     <input id="api_token" name="api_token" type="password" required spellcheck="false">
     <label for="owner_password">Bridge owner password</label>

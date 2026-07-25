@@ -37,6 +37,7 @@ describe("OAuth-protected InvenTree MCP", () => {
   const config: Config = {
     publicUrl: new URL("https://mcp.example.test"),
     resourceUrl: "https://mcp.example.test/mcp",
+    inventreeUrl: "http://127.0.0.1",
     port: 3000,
     ownerPassword: "owner-secret-long-enough",
     encryptionKey: Buffer.alloc(32, 7),
@@ -50,6 +51,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     await new Promise<void>((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
     const address = upstreamServer.address() as AddressInfo;
     upstreamUrl = `http://127.0.0.1:${address.port}`;
+    config.inventreeUrl = upstreamUrl;
     app = createApp(config).app;
   });
 
@@ -93,6 +95,7 @@ describe("OAuth-protected InvenTree MCP", () => {
         code_challenge_method: "S256",
       })
       .expect(200);
+    assert.doesNotMatch(authorization.text, /name="inventree_url"/);
     const requestId = /name="request_id" value="([^"]+)"/.exec(authorization.text)?.[1];
     assert.ok(requestId);
 
@@ -101,7 +104,7 @@ describe("OAuth-protected InvenTree MCP", () => {
       .type("form")
       .send({
         request_id: requestId,
-        inventree_url: upstreamUrl,
+        inventree_url: "http://127.0.0.1:1",
         api_token: "correct-inventree-token",
         owner_password: config.ownerPassword,
       })

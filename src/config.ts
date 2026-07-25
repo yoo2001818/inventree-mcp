@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { normalizeInvenTreeUrl } from "./inventree.js";
 
 export interface Config {
   publicUrl: URL;
   resourceUrl: string;
+  inventreeUrl: string;
   port: number;
   ownerPassword: string;
   encryptionKey: Buffer;
@@ -37,9 +39,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("OWNER_PASSWORD must be at least 16 bytes long");
   }
 
+  const inventreeUrl = normalizeInvenTreeUrl(required("INVENTREE_URL", env.INVENTREE_URL));
+
   return {
     publicUrl,
     resourceUrl: new URL("/mcp", publicUrl).toString(),
+    inventreeUrl,
     port: Number.parseInt(env.PORT ?? "3000", 10),
     ownerPassword,
     encryptionKey,

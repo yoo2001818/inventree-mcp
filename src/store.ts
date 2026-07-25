@@ -28,7 +28,6 @@ export interface AuthorizationCode extends Omit<PendingAuthorization, "id" | "st
 
 export interface StoredCredentials {
   id: string;
-  inventreeUrl: string;
   encryptedApiToken: EncryptedValue;
   label: string;
   createdAt: number;

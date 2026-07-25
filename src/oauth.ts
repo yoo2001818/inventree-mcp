@@ -4,7 +4,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { Config } from "./config.js";
 import { decrypt, encrypt, hashToken, pkceS256, randomToken, secureEqual } from "./crypto.js";
 import { authorizationPage } from "./html.js";
-import { InvenTreeClient, normalizeInvenTreeUrl } from "./inventree.js";
+import { InvenTreeClient } from "./inventree.js";
 import { JsonStore, type PendingAuthorization } from "./store.js";
 
 const ALLOWED_SCOPES = new Set(["inventree.read", "inventree.write"]);
@@ -82,7 +82,7 @@ export class OAuthService {
     const stored = this.store.snapshot.credentials[credentialsId];
     if (!stored) throw new Error("Linked InvenTree credentials no longer exist");
     return {
-      baseUrl: stored.inventreeUrl,
+      baseUrl: this.config.inventreeUrl,
       apiToken: decrypt(stored.encryptedApiToken, this.config.encryptionKey),
     };
   }
@@ -191,7 +191,6 @@ export class OAuthService {
           clientName: client?.clientName ?? "ChatGPT",
           scopes: pending.scope,
           error: message,
-          inventreeUrl: String(req.body.inventree_url ?? ""),
         }),
       );
 
@@ -212,10 +211,12 @@ export class OAuthService {
     this.failedOwnerAttempts.delete(attemptKey);
 
     try {
-      const inventreeUrl = normalizeInvenTreeUrl(String(req.body.inventree_url ?? ""));
       const apiToken = String(req.body.api_token ?? "").trim();
       if (!apiToken) throw new Error("InvenTree API token is required");
-      const connection = await new InvenTreeClient({ baseUrl: inventreeUrl, apiToken }).testConnection();
+      const connection = await new InvenTreeClient({
+        baseUrl: this.config.inventreeUrl,
+        apiToken,
+      }).testConnection();
       const credentialsId = randomToken(18);
       const code = randomToken(32);
       const now = Date.now();
@@ -223,7 +224,6 @@ export class OAuthService {
         delete data.pendingAuthorizations[requestId];
         data.credentials[credentialsId] = {
           id: credentialsId,
-          inventreeUrl,
           encryptedApiToken: encrypt(apiToken, this.config.encryptionKey),
           label: connection.username,
           createdAt: now,
