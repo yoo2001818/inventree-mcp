@@ -34,6 +34,9 @@ import type { InventoryEntityType, MutationOutput } from "./store.js";
 
 const positiveQuantity = z.number().positive().finite();
 const optionalText = () => z.string().max(50_000).nullable().optional();
+const partUnitsSchema = z.string().trim().min(1).max(20).nullable().optional().describe(
+  "Formal InvenTree unit such as m, kg, L, piece, each, dozen, hundred, or thousand. Omit unless the user explicitly specifies a unit; never use arbitrary nouns, localized counting words, or packaging.",
+);
 const entityIdSchema = () => z.union([
   z.number().int().positive(),
   z.string().min(1).describe("Existing numeric ID or a server-issued ref from an earlier plan step"),
@@ -146,6 +149,23 @@ function ensureStockDestination(location: JsonRecord): void {
 
 async function checksFor(client: InvenTreeClient, paths: Array<[string, Record<string, unknown>?]>): Promise<MutationCheck[]> {
   return Promise.all(paths.map(([path, query]) => captureCheck(client, path, query)));
+}
+
+async function validatePartUnits(client: InvenTreeClient, units: string | null | undefined): Promise<void> {
+  if (units === undefined || units === null) return;
+  const response = record(await client.get("/api/units/all/"));
+  const available = record(response.available_units);
+  if (Object.hasOwn(available, units)) return;
+  const preferred = ["piece", "each", "dozen", "hundred", "thousand", "m", "kg", "L"]
+    .filter((candidate) => Object.hasOwn(available, candidate));
+  throw new DomainError(
+    {
+      status: "invalid_unit",
+      supplied_unit: units,
+      ...(preferred.length ? { common_units: preferred } : {}),
+    },
+    `"${units}" is not a configured InvenTree unit. Omit units unless a formal measurement or counting unit is required${preferred.length ? `; common choices include ${preferred.join(", ")}` : ""}.`,
+  );
 }
 
 function beforeAfter(label: string, before: unknown, after: unknown): string | undefined {
@@ -271,7 +291,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService, image
           category_id: entityIdSchema(),
           IPN: z.string().max(100).default(""),
           keywords: z.array(z.string().min(1)).default([]),
-          units: z.string().max(20).nullable().optional(),
+          units: partUnitsSchema,
           minimum_stock: z.number().nonnegative().default(0),
           maximum_stock: z.number().nonnegative().default(0),
           default_location_id: nullableEntityIdSchema().optional(),
@@ -298,6 +318,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService, image
     async (input, extra) =>
       safely(oauth, async () => {
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+        await validatePartUnits(client, input.part.units);
         const categoryId = normalizeEntityId(input.part.category_id);
         const categoryOutput = plannedOutput(oauth, auth, input.plan_id, categoryId, "part_category");
         const category = typeof categoryId === "number" ? await getCategory(client, categoryId) : undefined;
@@ -457,7 +478,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService, image
           category_id: nullableEntityIdSchema().optional(),
           IPN: z.string().max(100).optional(),
           keywords: z.array(z.string().min(1)).optional(),
-          units: z.string().max(20).nullable().optional(),
+          units: partUnitsSchema,
           minimum_stock: z.number().nonnegative().optional(),
           maximum_stock: z.number().nonnegative().optional(),
           default_location_id: nullableEntityIdSchema().optional(),
@@ -477,6 +498,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService, image
         const { changes } = input;
         const part_id = normalizeEntityId(input.part_id);
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
+        await validatePartUnits(client, changes.units);
         const partOutput = plannedOutput(oauth, auth, input.plan_id, part_id, "part");
         const part = typeof part_id === "number" ? await getPart(client, part_id) : undefined;
         if (part) ensureUnlocked(part);

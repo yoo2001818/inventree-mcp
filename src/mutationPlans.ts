@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { randomToken } from "./crypto.js";
 import { DomainError, versionConflict } from "./domainErrors.js";
-import { InvenTreeClient } from "./inventree.js";
+import { InvenTreeClient, InvenTreeError } from "./inventree.js";
 import type { PartImageUploads } from "./partImages.js";
 import type { OAuthService } from "./oauth.js";
 import type {
@@ -419,7 +419,15 @@ export async function commitPlan(
         oauth.store.mutate((data) => {
           Object.assign(data.mutationPlans[plan.id]!, { state: "failed", commitResult: failed, updatedAt: Date.now(), expiresAt: Date.now() + COMMITTED_PLAN_TTL_MS });
         });
-        throw new Error(`Inventory plan failed at ${step.id} after ${completedRequests} upstream operations: ${(error as Error).message}`, { cause: error });
+        const message = `Inventory plan failed at ${step.id} after ${completedRequests} upstream operations: ${(error as Error).message}`;
+        if (error instanceof InvenTreeError) {
+          throw new InvenTreeError(message, error.status, error.details, {
+            failed_step_id: step.id,
+            completed_steps: completedSteps,
+            completed_operations: completedRequests,
+          });
+        }
+        throw new Error(message, { cause: error });
       }
     }
     completedSteps += 1;

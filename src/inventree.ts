@@ -8,11 +8,18 @@ export interface BinaryResponse {
   contentType: string;
 }
 
+export interface InvenTreeErrorContext {
+  failed_step_id?: string;
+  completed_steps?: number;
+  completed_operations?: number;
+}
+
 export class InvenTreeError extends Error {
   constructor(
     message: string,
     readonly status?: number,
     readonly details?: unknown,
+    readonly context?: InvenTreeErrorContext,
   ) {
     super(message);
   }

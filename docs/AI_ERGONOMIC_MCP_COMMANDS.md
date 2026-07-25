@@ -322,7 +322,6 @@ Suggested intent:
     "category_id": 15,
     "IPN": "R-10K-0603-1P",
     "keywords": ["10k", "0603", "resistor"],
-    "units": "pcs",
     "minimum_stock": 50,
     "default_location_id": 81,
     "trackable": false,
@@ -341,6 +340,8 @@ Suggested intent:
 
 The public tool schema should not expose assembly, build, purchasing, sales, supplier, pricing, or revision fields. Server-side defaults should set irrelevant feature flags consistently. Before preparing the write, the server should run a duplicate search using name, IPN, and keywords and return candidates if found.
 
+`units` is optional and should normally be omitted for ordinary individually counted household items. It is not a free-form display label: when explicitly needed, it must be a formal measurement or counting unit configured in InvenTree, such as `m`, `kg`, `L`, `piece`, `each`, `dozen`, `hundred`, or `thousand`. Never send localized counting words, arbitrary item nouns, or packaging descriptions as units. If supplied, the connector validates the exact value against `/api/units/all/` before creating a plan; invalid units therefore cannot cause a partially committed create workflow.
+
 Implementation may use the part endpoint's `initial_stock` support or create the part and stock item as two validated steps. If upstream cannot make that atomic, the preview should disclose the two steps and the server should report partial failure precisely.
 
 ### `update_part`
@@ -349,7 +350,8 @@ Purpose: rename, recategorize, annotate, deactivate/reactivate, or change home-i
 
 Suggested editable fields:
 
-- name, description, category ID, IPN, keywords, units
+- name, description, category ID, IPN, keywords
+- formal units only when the user explicitly requests a measurement/counting unit
 - minimum and maximum stock
 - default location ID and default expiry
 - link, notes, tags
@@ -532,7 +534,7 @@ After confirmation, `commit_inventory_plan(plan_id, expected_version)` freezes a
 
 Only the commit tool is destructive. Staging and plan-editing tools use `destructiveHint: false`; the commit tool uses `destructiveHint: true`. Append operations use idempotency keys and plan versions to prevent duplicate or lost updates.
 
-Several InvenTree requests committed from one plan are orchestrated as one reviewed action but are not an upstream database transaction. Partial completion must be reported precisely; automatic rollback must not be assumed.
+Several InvenTree requests committed from one plan are orchestrated as one reviewed action but are not an upstream database transaction. Partial completion must be reported precisely; automatic rollback must not be assumed. If InvenTree rejects a request, the MCP error must preserve the failed immutable step ID, completed-operation count, HTTP status, and sanitized upstream validation body in structured content. Wrapping an upstream exception must not discard field-level DRF errors such as `{ "units": ["Select a valid choice."] }`.
 
 ### Stable plan identity
 

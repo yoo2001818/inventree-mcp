@@ -84,6 +84,12 @@ describe("OAuth-protected InvenTree MCP", () => {
     next();
   });
   fakeInvenTree.get("/api/user/me/", (_req, res) => res.json({ pk: 1, username: "workbench" }));
+  fakeInvenTree.get("/api/units/all/", (_req, res) => res.json({
+    default_system: "mks",
+    available_units: Object.fromEntries(
+      ["pcs", "piece", "each", "dozen", "hundred", "thousand", "m", "kg", "L"].map((name) => [name, { name }]),
+    ),
+  }));
   fakeInvenTree.get("/api/part/category/tree/", (_req, res) =>
     res.json({ count: 1, next: null, previous: null, results: [category] }),
   );
@@ -160,7 +166,12 @@ describe("OAuth-protected InvenTree MCP", () => {
     part.total_in_stock = stockItem.quantity;
     res.status(201).json(req.body);
   });
-  fakeInvenTree.post("/api/part/", (req, res) => res.status(201).json({ ...req.body, pk: 1001 }));
+  fakeInvenTree.post("/api/part/", (req, res) => {
+    if (req.body.name === "Rejected part") {
+      return res.status(400).json({ units: ["Select a valid choice."], secret_token: "must-not-leak" });
+    }
+    return res.status(201).json({ ...req.body, pk: 1001 });
+  });
   fakeInvenTree.post("/api/stock/", (req, res) => res.status(201).json([{ ...req.body, pk: 1002 }]));
   fakeInvenTree.patch("/api/part/:id/", express.raw({ type: () => true, limit: "10mb" }), (req, res) => {
     partImagePatches.push({ contentType: req.header("content-type") ?? "", body: Buffer.from(req.body) });
@@ -992,6 +1003,67 @@ describe("OAuth-protected InvenTree MCP", () => {
     assert.deepEqual(tree.body.result.structuredContent.data.expandableRootIds, [3000, 3001, 3002, 3003, 3004, 3005]);
     assert.deepEqual(tree.body.result.structuredContent.data.root, { id: 1, name: "Root", path: "Root" });
     assert.match(tree.body.result.content[0].text, /^## Selected location: Root \(#1\)/);
+  });
+
+  it("validates formal part units before staging and preserves upstream commit details", async () => {
+    const accessToken = await authorizeToken("inventree.read inventree.write");
+
+    const invalidUnit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 65,
+      method: "tools/call",
+      params: {
+        name: "create_part_with_stock",
+        arguments: {
+          operation_id: "invalid-localized-unit",
+          part: { name: "Household item", category_id: 15, units: "개" },
+        },
+      },
+    });
+    assert.equal(invalidUnit.body.result.isError, true);
+    assert.equal(invalidUnit.body.result.structuredContent.data.status, "invalid_unit");
+    assert.equal(invalidUnit.body.result.structuredContent.data.supplied_unit, "개");
+    assert.equal(invalidUnit.body.result.structuredContent.data.plan_id, undefined);
+    assert.match(invalidUnit.body.result.content[0].text, /Omit units unless/);
+
+    const staged = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 66,
+      method: "tools/call",
+      params: {
+        name: "create_part_with_stock",
+        arguments: {
+          operation_id: "upstream-validation-detail",
+          allow_possible_duplicates: true,
+          part: { name: "Rejected part", category_id: 15 },
+        },
+      },
+    });
+    assert.equal(staged.body.result.structuredContent.data.status, "staged");
+
+    const commit = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 67,
+      method: "tools/call",
+      params: {
+        name: "commit_inventory_plan",
+        arguments: {
+          plan_id: staged.body.result.structuredContent.data.plan_id,
+          expected_version: 1,
+        },
+      },
+    });
+    assert.equal(commit.body.result.isError, true);
+    assert.equal(commit.body.result.structuredContent.data.status, "upstream_error");
+    assert.equal(commit.body.result.structuredContent.data.http_status, 400);
+    assert.match(commit.body.result.structuredContent.data.failed_step_id, /^stp_/);
+    assert.equal(commit.body.result.structuredContent.data.completed_steps, 0);
+    assert.equal(commit.body.result.structuredContent.data.completed_operations, 0);
+    assert.deepEqual(commit.body.result.structuredContent.data.details, {
+      units: ["Select a valid choice."],
+    });
+    assert.doesNotMatch(JSON.stringify(commit.body.result), /must-not-leak|secret_token/);
+    assert.match(commit.body.result.content[0].text, /failed at stp_.*HTTP 400/);
   });
 
   it("downloads part images and commits temporary uploads as multipart data", async () => {

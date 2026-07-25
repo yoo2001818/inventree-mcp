@@ -50,14 +50,26 @@ function sanitizedDetails(value: unknown, depth = 0): unknown {
   return String(value).slice(0, 500);
 }
 
+function upstreamError(error: unknown): InvenTreeError | undefined {
+  let current = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    if (current instanceof InvenTreeError) return current;
+    current = current.cause;
+  }
+  return undefined;
+}
+
 export function errorResult(error: unknown, oauth: OAuthService) {
   const message = error instanceof Error ? error.message : String(error);
   const domainData = error instanceof DomainError ? error.data : undefined;
-  const upstreamData = error instanceof InvenTreeError
+  const upstream = upstreamError(error);
+  const upstreamData = upstream
     ? {
         status: "upstream_error",
-        ...(error.status ? { http_status: error.status } : {}),
-        ...(error.details === undefined ? {} : { details: sanitizedDetails(error.details) }),
+        message,
+        ...upstream.context,
+        ...(upstream.status ? { http_status: upstream.status } : {}),
+        ...(upstream.details === undefined ? {} : { details: sanitizedDetails(upstream.details) }),
       }
     : undefined;
   const data = domainData ?? upstreamData ?? { status: "error", message };
