@@ -706,11 +706,13 @@ describe("OAuth-protected InvenTree MCP", () => {
           entity_type: "stock_item",
           entities: [{ ref: stockRef }],
           template: "30x15mm",
+          copies: 3,
         },
       },
     });
     assert.equal(print.body.result.structuredContent.data.plan_version, 2);
     assert.match(print.body.result.content[0].text, /New capacitor.*Drawer A3/);
+    assert.match(print.body.result.content[0].text, /Print 3 copies/);
     assert.doesNotMatch(print.body.result.content[0].text, /Append related steps/);
 
     const review = await mcpRequest(accessToken, {
@@ -735,6 +737,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     });
     assert.match(extendedReview.body.result.content[0].text, /interactive extended-confirmation view/i);
 
+    const printRequestCountBeforeCommit = printedLabelBodies.length;
     const commit = await mcpRequest(accessToken, {
       jsonrpc: "2.0",
       id: 23,
@@ -742,7 +745,13 @@ describe("OAuth-protected InvenTree MCP", () => {
       params: { name: "commit_inventory_plan", arguments: { plan_id: planId, expected_version: 2 } },
     });
     assert.equal(commit.body.result.structuredContent.data.resolved_refs[stockRef], 1002);
-    assert.deepEqual(printedLabelBodies.at(-1), { template: 20, plugin: "zebra", items: [1002] });
+    assert.equal(printedLabelBodies.length, printRequestCountBeforeCommit + 1);
+    assert.deepEqual(printedLabelBodies.at(-1), {
+      template: 20,
+      plugin: "zebra",
+      items: [1002],
+      number_of_labels: 3,
+    });
   });
 
   it("uses immutable step IDs and protects dependent future references during plan edits", async () => {

@@ -1638,7 +1638,8 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
         entities: z.array(entitySelectorSchema).min(1).max(100),
         template: z.string().min(1).describe("Template ID like #20, exact name, or dimensions like 30x15mm"),
         printer: z.string().min(1).default("zebra").describe("InvenTree label printing plugin slug"),
-        copies: z.number().int().min(1).max(20).default(1),
+        copies: z.number().int().min(1).max(99).default(1)
+          .describe("Number of copies per entity, passed to the printer as number_of_labels"),
       },
       annotations: mutationAnnotations(),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -1708,11 +1709,16 @@ function registerLabelTool(server: McpServer, oauth: OAuthService): void {
               : [];
           }),
         ];
-        const requests: MutationRequest[] = Array.from({ length: input.copies }, () => ({
+        const requests: MutationRequest[] = [{
           method: "POST" as const,
           path: "/api/label/print/",
-          body: { template: numberValue(template.pk), plugin: input.printer, items: resolved.map(({ item }) => item) },
-        }));
+          body: {
+            template: numberValue(template.pk),
+            plugin: input.printer,
+            items: resolved.map(({ item }) => item),
+            number_of_labels: input.copies,
+          },
+        }];
         return stageMutation(oauth, auth, input, summary, requests, await checksFor(client, checkPaths));
       }),
   );

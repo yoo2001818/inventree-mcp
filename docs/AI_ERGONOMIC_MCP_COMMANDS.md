@@ -493,6 +493,8 @@ Suggested input:
 
 The tool should discover enabled templates from `/api/label/template/`, filtered by `model_type`, and expose human-readable choices. Do not permanently encode the old GPT's template IDs `17` through `22`; IDs are instance-specific and may drift. A deployment configuration may define aliases such as `30x15mm` after validating their model types.
 
+`copies` is the number of labels printed for each selected entity, from 1 through 99. The connector sends one `/api/label/print/` request and maps `copies` to the top-level request field `number_of_labels`; it must not simulate copies by submitting the same print job repeatedly. This relies on the selected printer plugin exposing that option, as the Zebra label plugin does.
+
 Printing is a real-world side effect. Always preview the entity names/paths, printer, template dimensions/name, and copy count before commit.
 
 ## Part image workflow
