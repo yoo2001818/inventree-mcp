@@ -8,6 +8,7 @@ import {
   formatRef,
   numberValue,
   optionalString,
+  partImagePath,
   pageResults,
   record,
   stringValue,
@@ -669,7 +670,7 @@ export function registerWriteTools(server: McpServer, oauth: OAuthService, image
         if (part) ensureUnlocked(part);
         const upload = imageUploads.get(input.upload_ref, authenticatedCredentialsId(auth));
         const identity = plannedLabel(partOutput, part ? formatRef(partRef(part)) : `Part ${String(partId)}`);
-        const currentImage = part ? optionalString(part.image) ?? optionalString(part.thumbnail) : undefined;
+        const currentImage = part ? partImagePath(part.image) ?? partImagePath(part.thumbnail) : undefined;
         const summary = [
           `Replace image for ${identity}:`,
           `- Current image: ${currentImage ? "present" : "none"}`,

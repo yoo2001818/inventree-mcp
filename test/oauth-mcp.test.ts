@@ -124,6 +124,9 @@ describe("OAuth-protected InvenTree MCP", () => {
   });
   fakeInvenTree.get("/api/part/:id/", (req, res) => {
     if (req.params.id === "99999999") return res.status(404).json({ detail: "No Part matches", barcode_hash: "must-not-leak" });
+    if (req.params.id === "43") {
+      return res.json({ ...part, pk: 43, name: "Part without image", image: null, thumbnail: "/static/img/blank_image.thumbnail.png" });
+    }
     return res.json(part);
   });
   fakeInvenTree.get("/api/part/", (req, res) => {
@@ -939,6 +942,20 @@ describe("OAuth-protected InvenTree MCP", () => {
 
   it("downloads part images and commits temporary uploads as multipart data", async () => {
     const accessToken = await authorizeToken("inventree.read inventree.write");
+
+    const noImage = await mcpRequest(accessToken, {
+      jsonrpc: "2.0",
+      id: 69,
+      method: "tools/call",
+      params: { name: "get_part_image", arguments: { part_id: 43 } },
+    });
+    assert.equal(noImage.body.result.isError, true);
+    assert.deepEqual(noImage.body.result.structuredContent.data, {
+      status: "not_found",
+      entity_type: "part_image",
+      supplied_id: 43,
+      suggested_tool: "set_part_image",
+    });
 
     const image = await mcpRequest(accessToken, {
       jsonrpc: "2.0",

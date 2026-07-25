@@ -8,6 +8,7 @@ import {
   formatTree,
   normalizePart,
   page,
+  partImagePath,
 } from "../src/inventoryDomain.js";
 
 describe("AI-facing inventory formatting", () => {
@@ -49,6 +50,41 @@ describe("AI-facing inventory formatting", () => {
     assert.match(text, /Electronics > Resistors \(#15\)/);
     assert.match(text, /Living room > Drawer A3 \(#81\): 200 pcs \[stock #991\]/);
     assert.doesNotMatch(text, /pricing|purchase|assembly/);
+  });
+
+  it("does not treat InvenTree's blank thumbnail sentinel as a part image", () => {
+    const withoutImage = normalizePart({
+      pk: 238,
+      name: "Solder",
+      image: null,
+      thumbnail: "/static/img/blank_image.thumbnail.png",
+    });
+    const withImage = normalizePart({
+      pk: 124,
+      name: "Pen",
+      image: "/media/part_images/pen.jpg",
+      thumbnail: "/media/part_images/pen.thumbnail.jpg",
+    });
+
+    assert.equal(withoutImage.hasImage, undefined);
+    assert.equal(withImage.hasImage, true);
+  });
+
+  it("accepts only relative InvenTree media paths as part images", () => {
+    assert.equal(partImagePath("/media/part_images/part.png"), "/media/part_images/part.png");
+    for (const rejected of [
+      "/static/img/blank_image.thumbnail.png",
+      "/static/img/custom-part.png",
+      "/media-not-really/part.png",
+      "https://inventree.example/media/part_images/part.png",
+      "media/part_images/part.png",
+      "/media/../static/part.png",
+      "/media/part_images/part.png?download=1",
+      "",
+      null,
+    ]) {
+      assert.equal(partImagePath(rejected), undefined);
+    }
   });
 
   it("labels location pagination as a stock-item range and page-local part count", () => {

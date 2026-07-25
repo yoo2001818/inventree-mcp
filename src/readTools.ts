@@ -15,6 +15,7 @@ import {
   normalizeStock,
   numberValue,
   optionalString,
+  partImagePath,
   page,
   pageResults,
   record,
@@ -388,8 +389,8 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.read");
         const part = record(await requiredPart(client, input.part_id));
         const selectedPath = input.variant === "thumbnail"
-          ? optionalString(part.thumbnail) ?? optionalString(part.image)
-          : optionalString(part.image) ?? optionalString(part.thumbnail);
+          ? partImagePath(part.thumbnail) ?? partImagePath(part.image)
+          : partImagePath(part.image) ?? partImagePath(part.thumbnail);
         if (!selectedPath) {
           throw notFound(
             "part_image",

@@ -60,16 +60,12 @@ export class InvenTreeClient {
   }
 
   async downloadMedia(path: string, maxBytes: number): Promise<BinaryResponse> {
-    if (path.includes("..") || path.includes("?") || path.includes("#")) {
+    if (!path.startsWith("/media/") || path.includes("..") || path.includes("?") || path.includes("#")) {
       throw new InvenTreeError("InvenTree returned an invalid media path");
     }
     const baseUrl = new URL(`${this.credentials.baseUrl}/`);
     const url = new URL(path, baseUrl);
-    const configuredPrefix = `${baseUrl.pathname.replace(/\/$/, "")}/media/`.replace(/\/{2,}/g, "/");
-    if (
-      url.origin !== baseUrl.origin ||
-      (!url.pathname.startsWith("/media/") && !url.pathname.startsWith(configuredPrefix))
-    ) {
+    if (url.origin !== baseUrl.origin || !url.pathname.startsWith("/media/")) {
       throw new InvenTreeError("Media path escaped the configured InvenTree media namespace");
     }
     const controller = new AbortController();

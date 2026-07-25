@@ -501,6 +501,8 @@ Printing is a real-world side effect. Always preview the entity names/paths, pri
 
 Inputs: numeric `part_id` and `variant: "thumbnail" | "preview" | "original"`, defaulting to `thumbnail`. For `thumbnail` and `preview`, the connector downloads the trusted InvenTree media path during the MCP call, validates its byte bound, signature, dimensions, and MIME consistency, and returns one base64 MCP image content block plus compact metadata. The client needs no follow-up HTTP request.
 
+Only relative paths beginning with `/media/` count as part images. Treat every other value as missing everywhere: it must not set `hasImage`, appear as the current image in mutation previews, or satisfy `get_part_image` fallback selection. This general rule excludes InvenTree's current `/static/img/blank_image.thumbnail.png` placeholder without depending on that particular filename and rejects absolute or unexpected paths.
+
 For `original`, the connector instead returns an MCP resource link plus a short-lived direct-download URL. This avoids expanding a potentially large original file into base64 inside the MCP response. The URL contains an unguessable capability token, requires no OAuth header, and proxies only the stored credential's trusted InvenTree media path. Capability query strings are excluded from access logs. No variant accepts an arbitrary caller-supplied URL.
 
 ### `prepare_part_image_upload`, upload status, and `set_part_image`

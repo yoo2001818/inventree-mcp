@@ -68,6 +68,16 @@ export function optionalString(value: unknown): string | undefined {
   return text || undefined;
 }
 
+export function partImagePath(value: unknown): string | undefined {
+  const path = optionalString(value);
+  if (!path?.startsWith("/media/") || path.includes("?") || path.includes("#")) return undefined;
+  try {
+    return new URL(path, "http://inventree.invalid").pathname.startsWith("/media/") ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -185,7 +195,7 @@ export function normalizePart(partValue: unknown, stockValues: unknown[] = []): 
     ...(part.active === false ? { active: false } : {}),
     ...(part.locked === true ? { locked: true } : {}),
     ...(part.trackable === true ? { trackable: true } : {}),
-    ...(optionalString(part.image) || optionalString(part.thumbnail) ? { hasImage: true as const } : {}),
+    ...(partImagePath(part.image) || partImagePath(part.thumbnail) ? { hasImage: true as const } : {}),
     ...(placements.length ? { placements } : {}),
   };
 }
