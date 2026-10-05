@@ -85,6 +85,23 @@ describe("OAuth-protected InvenTree MCP", () => {
   const createdStockBodies: Record<string, unknown>[] = [];
   const catalogWrites: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
   const stockMetadataPatches: Record<string, unknown>[] = [];
+  const purchaseWrites: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const purchaseOrders = new Map<number, Record<string, unknown>>([
+    [1101, { pk: 1101, reference: "PO-001", status: 10, supplier: 501 }],
+  ]);
+  const purchaseLines = new Map<number, Record<string, unknown>>([
+    [1201, { pk: 1201, order: 1101, part: 701, quantity: 100, received: 40 }],
+  ]);
+  const purchaseStock = new Map<number, Record<string, unknown>>();
+  let purchasePk = 5000;
+  let failReceiptStatusCorrection = false;
+  fakeInvenTree.post("/api/stock/change_status/", (req, res) => {
+    purchaseWrites.push({ path: req.path, body: req.body });
+    if (failReceiptStatusCorrection) return res.status(400).json({ detail: "Status correction rejected" });
+    if (req.body.items.some((id: unknown) => typeof id !== "number")) return res.status(400).json({ items: ["Expected stock primary keys"] });
+    for (const id of req.body.items) purchaseStock.get(id)!.status = req.body.status;
+    return res.json(req.body);
+  });
   const catalog = new Map<string, Map<number, Record<string, unknown>>>([
     [catalogPaths.company, new Map([
       [501, { pk: 501, name: "LCSC", is_supplier: true, is_manufacturer: false, active: true }],
@@ -113,6 +130,7 @@ describe("OAuth-protected InvenTree MCP", () => {
   const partDetail = (value: unknown) => createdParts.get(Number(value)) ?? (Number(value) === 43 ? { ...part, pk: 43 } : part);
   function enrichedCatalog(path: string, item: Record<string, unknown>) {
     const data = { ...item };
+    if (path === catalogPaths.supplier_part) data.pack_quantity_native = Number(item.pack_quantity || 1);
     if (item.part) data.part_detail = partDetail(item.part);
     for (const key of ["supplier", "manufacturer"]) if (item[key]) data[`${key}_detail`] = catalog.get(catalogPaths.company)?.get(Number(item[key]));
     if (item.manufacturer_part) {
@@ -214,9 +232,10 @@ describe("OAuth-protected InvenTree MCP", () => {
     Object.assign(stockItem, req.body);
     res.json(stockItem);
   });
-  fakeInvenTree.get("/api/stock/", (_req, res) =>
-    res.json({ count: 1, next: null, previous: null, results: [stockItem] }),
-  );
+  fakeInvenTree.get("/api/stock/", (req, res) => {
+    const rows = req.query.purchase_order ? [...purchaseStock.values()].filter((item) => String(item.purchase_order) === req.query.purchase_order) : [stockItem];
+    res.json({ count: rows.length, results: rows.slice(Number(req.query.offset ?? 0), Number(req.query.offset ?? 0) + Number(req.query.limit ?? 100)) });
+  });
   fakeInvenTree.post("/api/stock/add/", (req, res) => {
     const adjustment = req.body.items?.[0];
     stockItem.quantity += Number(adjustment?.quantity ?? 0);
@@ -299,15 +318,68 @@ describe("OAuth-protected InvenTree MCP", () => {
       return res.json(item);
     });
   }
-  fakeInvenTree.get("/api/order/po/", (req, res) => {
-    assert.equal(req.query.supplier, "501");
-    res.json({ count: 1, results: [{ pk: 1101, reference: "PO-001", status: 10, status_text: "Pending", supplier: 501, supplier_detail: { pk: 501, name: "LCSC" } }] });
-  });
-  fakeInvenTree.get("/api/order/po/:id/", (_req, res) => res.json({ pk: 1101, reference: "PO-001", status: 10, supplier: 501 }));
-  fakeInvenTree.get("/api/order/po-line/", (req, res) => {
-    assert.equal(req.query.order, "1101");
-    res.json({ count: 1, results: [{ pk: 1201, part: 701, internal_part: 42, part_detail: part,
-      sku: "C57112", mpn: "0603B103K500NT", quantity: "100", received: "40" }] });
+  const enrichedOrder = (item: Record<string, unknown>): Record<string, unknown> => ({ ...item,
+    status_text: ({ 10: "Pending", 20: "Placed", 25: "On Hold", 30: "Complete", 40: "Cancelled" } as Record<string, string>)[String(item.status)],
+    supplier_detail: catalog.get(catalogPaths.company)?.get(Number(item.supplier)) });
+  const enrichedLine = (item: Record<string, unknown>): Record<string, unknown> => {
+    const supplier = catalog.get(catalogPaths.supplier_part)?.get(Number(item.part));
+    return { ...item, internal_part: supplier?.part, part_detail: partDetail(supplier?.part),
+      purchase_price: item.purchase_price == null ? null : Number(item.purchase_price),
+      supplier_part_detail: supplier ? enrichedCatalog(catalogPaths.supplier_part, supplier) : undefined,
+      sku: supplier?.SKU, mpn: "0603B103K500NT" };
+  };
+  for (const [path, rows, enrich] of [["/api/order/po/", purchaseOrders, enrichedOrder], ["/api/order/po-line/", purchaseLines, enrichedLine]] as const) {
+    fakeInvenTree.get(path, (req, res) => {
+      const values = [...rows.values()].filter((item) =>
+        (!req.query.order || String(item.order) === req.query.order) && (!req.query.supplier || String(item.supplier) === req.query.supplier) &&
+        (!req.query.search || String(item.reference).includes(String(req.query.search))));
+      res.json({ count: values.length, results: values.slice(Number(req.query.offset ?? 0), Number(req.query.offset ?? 0) + Number(req.query.limit ?? 100)).map(enrich) });
+    });
+    fakeInvenTree.get(`${path}:id/`, (req, res) => {
+      const item = rows.get(Number(req.params.id));
+      return item ? res.json(enrich(item)) : res.status(404).json({ detail: "No purchase record" });
+    });
+    fakeInvenTree.post(path, (req, res) => {
+      purchaseWrites.push({ path, body: req.body });
+      const item = { ...(path.endsWith("po/") ? { status: 10 } : { received: 0 }), ...req.body, pk: ++purchasePk };
+      rows.set(item.pk, item); res.status(201).json(enrich(item));
+    });
+    fakeInvenTree.patch(`${path}:id/`, (req, res) => {
+      const item = rows.get(Number(req.params.id));
+      if (!item) return res.status(404).json({ detail: "No purchase record" });
+      if (path === "/api/order/po-line/" && (!req.body.order || !req.body.part)) return res.status(400).json({
+        order: ["Purchase order must be specified"], part: ["Supplier part must be specified"],
+      });
+      purchaseWrites.push({ path: req.path, body: req.body });
+      Object.assign(item, req.body); return res.json(enrich(item));
+    });
+  }
+  fakeInvenTree.post("/api/order/po/:id/:action/", (req, res) => {
+    const order = purchaseOrders.get(Number(req.params.id));
+    if (!order) return res.status(404).json({ detail: "No purchase order" });
+    purchaseWrites.push({ path: req.path, body: req.body });
+    if (req.params.action === "receive") {
+      const stock = req.body.items.flatMap((item: Record<string, unknown>) => {
+        const line = purchaseLines.get(Number(item.line_item))!;
+        const supplier = catalog.get(catalogPaths.supplier_part)!.get(Number(line.part))!;
+        const factor = Number(supplier.pack_quantity || 1);
+        line.received = Number(line.received) + Number(item.quantity);
+        const serials = item.serial_numbers ? String(item.serial_numbers).split(",") : [null];
+        return serials.map((serial) => {
+          const lot = { pk: ++purchasePk, purchase_order: order.pk, supplier_part: supplier.pk, part: supplier.part,
+            // Match InvenTree 1.5.6: serialized receipt status is lost before saving.
+            serial, status: serial ? 10 : item.status,
+            part_detail: partDetail(supplier.part), quantity: serial ? 1 : Number(item.quantity) * factor, location: item.location, location_detail: location,
+            batch: item.batch_code, packaging: item.packaging, expiry_date: item.expiry_date, notes: item.note,
+            purchase_price: line.purchase_price == null ? null : String(Number(line.purchase_price) / factor), purchase_price_currency: line.purchase_price_currency };
+          purchaseStock.set(lot.pk, lot); return lot;
+        });
+      });
+      if ([...purchaseLines.values()].filter((line) => line.order === order.pk).every((line) => Number(line.received) >= Number(line.quantity))) order.status = 30;
+      return res.status(201).json(stock);
+    }
+    order.status = ({ issue: 20, hold: 25, complete: 30, cancel: 40 } as Record<string, number>)[req.params.action!];
+    return res.status(201).json({});
   });
   fakeInvenTree.get("/api/build/", (req, res) => {
     assert.equal(req.query.part, "42");
@@ -596,6 +668,8 @@ describe("OAuth-protected InvenTree MCP", () => {
       "create_stock_location", "update_stock_location", "print_labels", "create_company", "update_company",
       "create_manufacturer_part", "update_manufacturer_part", "create_supplier_part", "update_supplier_part",
       "create_parameter_template", "update_parameter_template", "set_part_parameters",
+      "create_purchase_order", "update_purchase_order", "create_purchase_order_line", "update_purchase_order_line",
+      "issue_purchase_order", "hold_purchase_order", "cancel_purchase_order", "complete_purchase_order", "receive_purchase_order",
     ]) {
       assert.match(planSchema, new RegExp(action), `missing create_inventory_plan action: ${action}`);
     }
@@ -616,7 +690,7 @@ describe("OAuth-protected InvenTree MCP", () => {
     collectOutputEnums(stageTool.inputSchema);
     assert.ok(outputEnums.length > 0, "create_inventory_plan did not publish output-name enums");
     for (const values of outputEnums) {
-      assert.deepEqual(values, ["part", "stock_item", "part_category", "stock_location", "company", "manufacturer_part", "supplier_part", "parameter_template"]);
+      assert.deepEqual(values, ["part", "stock_item", "part_category", "stock_location", "company", "manufacturer_part", "supplier_part", "parameter_template", "purchase_order", "purchase_order_line"]);
     }
     const assertPreciseFields = (schema: unknown, path = "inputSchema") => {
       if (!schema || typeof schema !== "object") return;
@@ -728,10 +802,10 @@ describe("OAuth-protected InvenTree MCP", () => {
       assert.deepEqual(bytes, readFileSync(new URL(`../skills/inventree-inventory/${item.uri.slice(baseUri.length)}`, import.meta.url)));
       textByUri.set(item.uri, content.text);
     }
-    for (const path of ["SKILL.md", "agents/openai.yaml", "references/workflows.md"]) assert.ok(textByUri.has(`${baseUri}${path}`));
+    for (const path of ["SKILL.md", "agents/openai.yaml", "references/workflows.md", "references/purchase-orders.md"]) assert.ok(textByUri.has(`${baseUri}${path}`));
     const main = textByUri.get(manifest.uri)!;
     assert.deepEqual(manifest.frontmatter, parse(/^---\n([\s\S]*?)\n---/.exec(main)![1]!));
-    for (const [arguments_, uri] of [[{}, manifest.uri], [{ section: "workflows" }, `${baseUri}references/workflows.md`]] as const) {
+    for (const [arguments_, uri] of [[{}, manifest.uri], [{ section: "workflows" }, `${baseUri}references/workflows.md`], [{ section: "purchase_orders" }, `${baseUri}references/purchase-orders.md`]] as const) {
       const guide = await callTool(token, "get_inventory_guide", arguments_);
       assert.ok(!guide.isError);
       assert.equal(guide.structuredContent.data.uri, uri);
@@ -1739,13 +1813,220 @@ describe("OAuth-protected InvenTree MCP", () => {
     } finally { part.locked = false; suppliers.delete(702); suppliers.delete(703); }
   });
 
+  it("stages and commits purchase orders, future lines, and partial pack receipts exactly once", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    const supplier = catalog.get(catalogPaths.supplier_part)!.get(701)!;
+    const originalPack = supplier.pack_quantity;
+    supplier.pack_quantity = "100";
+    const before = purchaseWrites.length;
+    const ref = (step: string, output: string) => ({ step, output });
+    try {
+      const staged = await stageCatalog(token, "purchase-future-workflow", [
+        { key: "po", action: "create_purchase_order", arguments: { reference: "PO-MCP-test", supplier_id: 501, destination_id: 81, order_currency: "USD" } },
+        { key: "meta", action: "update_purchase_order", arguments: { order_id: ref("po", "purchase_order"), changes: { description: "Parts intake", supplier_reference: "supplier-123" } } },
+        { key: "line", action: "create_purchase_order_line", arguments: { order_id: ref("po", "purchase_order"), supplier_part_id: 701, quantity: 3, purchase_price: "12.500000", purchase_price_currency: "USD", notes: "keep line note" } },
+        { key: "quantity", action: "update_purchase_order_line", arguments: { line_item_id: ref("line", "purchase_order_line"), changes: { quantity: 4 } } },
+        { key: "hold", action: "hold_purchase_order", arguments: { order_id: ref("po", "purchase_order") } },
+        { key: "issue", action: "issue_purchase_order", arguments: { order_id: ref("po", "purchase_order") } },
+        { key: "receipt", action: "receive_purchase_order", arguments: { order_id: ref("po", "purchase_order"), items: [
+          { line_item_id: ref("line", "purchase_order_line"), quantity: 2, batch: "PO-batch", notes: "Delivery 1" },
+        ] } },
+      ]);
+      assert.equal(purchaseWrites.length, before, "staging mutated purchase orders");
+      assert.match(staged.content[0].text, /2 supplier packs.*200/);
+      const committed = await commitCatalog(token, staged);
+      assert.equal(committed.structuredContent.data.status, "committed");
+      const ids = committed.structuredContent.data.resolved_refs;
+      const orderId = Number(ids[staged.structuredContent.data.aliases.po.purchase_order]);
+      const lineId = Number(ids[staged.structuredContent.data.aliases.line.purchase_order_line]);
+      assert.equal(purchaseOrders.get(orderId)!.status, 20);
+      assert.equal(purchaseOrders.get(orderId)!.supplier_reference, "supplier-123");
+      assert.equal(purchaseLines.get(lineId)!.quantity, 4);
+      assert.equal(purchaseLines.get(lineId)!.received, 2);
+      assert.equal(purchaseLines.get(lineId)!.notes, "keep line note");
+      assert.equal(purchaseWrites.find((item) => item.path === "/api/order/po-line/" && item.body.order === orderId)!.body.merge_items, false);
+      const after = purchaseWrites.length;
+      await commitCatalog(token, staged);
+      assert.equal(purchaseWrites.length, after, "commit replay duplicated a PO receipt");
+      const second = await stageCatalog(token, "purchase-second-delivery", [{ key: "receive", action: "receive_purchase_order", arguments: {
+        order_id: orderId, items: [{ line_item_id: lineId, quantity: 2, packaging: "reel" }],
+      } }]);
+      assert.equal((await commitCatalog(token, second)).structuredContent.data.status, "committed");
+      const detail = (await callTool(token, "get_purchase_order", { order_id: orderId, include_received_stock: true, include_notes: true, limit: 1 })).structuredContent.data;
+      assert.equal(detail.order.status, 30); assert.equal(detail.lines.results[0].received, 4);
+      assert.equal(detail.lines.results[0].purchasePrice, "12.5");
+      assert.equal(detail.lines.results[0].packQuantityNative, 100);
+      assert.equal(detail.receivedStock.count, 2); assert.ok(detail.receivedStock.nextCursor);
+      assert.equal(detail.receivedStock.results[0].supplierPartId, 701);
+      assert.equal(detail.receivedStock.results[0].quantity, 200);
+      assert.equal(detail.receivedStock.results[0].purchasePrice, "0.125");
+      const next = (await callTool(token, "get_purchase_order", { order_id: orderId, include_received_stock: true, stock_cursor: detail.receivedStock.nextCursor, limit: 1 })).structuredContent.data;
+      assert.equal(next.receivedStock.results[0].packaging, "reel");
+      const done = await stageCatalog(token, "purchase-complete-current", [{ key: "done", action: "complete_purchase_order", arguments: { order_id: orderId } }]);
+      assert.equal(done.structuredContent.data.status, "already_current");
+    } finally { supplier.pack_quantity = originalPack; }
+  });
+
+  it("validates purchase-order ownership, lifecycle, receipt limits, and ordering before staging", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    catalog.get(catalogPaths.company)!.set(5501, { pk: 5501, name: "Manufacturer only", active: true, is_supplier: false, is_manufacturer: true });
+    purchaseOrders.set(6101, { pk: 6101, reference: "PO-invalid", supplier: 501, status: 20 });
+    purchaseOrders.set(6102, { pk: 6102, reference: "PO-pending", supplier: 501, status: 10 });
+    purchaseOrders.set(6103, { pk: 6103, reference: "PO-terminal", supplier: 501, status: 40 });
+    purchaseLines.set(6201, { pk: 6201, order: 6101, part: 701, quantity: 100, received: 40 });
+    const sourceMap = catalog.get(catalogPaths.supplier_part)!;
+    sourceMap.set(7101, { pk: 7101, part: 42, supplier: 502, SKU: "wrong supplier", active: true });
+    const receipt = { order_id: 6101, location_id: 81, items: [{ line_item_id: 6201, quantity: 1 }] };
+    const before = purchaseWrites.length;
+    const cases: Array<[string, object, RegExp]> = [
+      ["create_purchase_order", { reference: "bad-role", supplier_id: 5501 }, /active supplier/],
+      ["create_purchase_order", { reference: "bad-inactive", supplier_id: 503 }, /active supplier/],
+      ["create_purchase_order", { reference: "PO-invalid", supplier_id: 501 }, /reference already exists/],
+      ["create_purchase_order_line", { order_id: 6101, supplier_part_id: 7101, quantity: 1 }, /order's supplier/],
+      ["update_purchase_order", { order_id: 6103, changes: { description: "cannot change" } }, /terminal/],
+      ["update_purchase_order_line", { line_item_id: 6201, changes: { quantity: 39 } }, /already received/],
+      ["issue_purchase_order", { order_id: 6102 }, /no lines/],
+      ["receive_purchase_order", { ...receipt, order_id: 6102 }, /placed/],
+      ["receive_purchase_order", { ...receipt, items: [{ line_item_id: 6201, quantity: 61 }] }, /remaining 60/],
+      ["receive_purchase_order", { ...receipt, order_id: 1101 }, /placed/],
+      ["receive_purchase_order", { ...receipt, location_id: 1 }, /structural/],
+      ["receive_purchase_order", { ...receipt, items: [{ line_item_id: 99999999, quantity: 1 }] }, /not found/],
+      ["receive_purchase_order", { ...receipt, items: [...receipt.items, ...receipt.items] }, /only once/],
+      ["complete_purchase_order", { order_id: 6101 }, /unreceived/],
+    ];
+    for (const [index, [action, arguments_, pattern]] of cases.entries()) {
+      const rejected = await stageCatalog(token, `bad-purchase-${index}`, [{ key: "action", action, arguments: arguments_ }]);
+      assert.equal(rejected.isError, true, action); assert.match(rejected.content[0].text, pattern);
+    }
+    purchaseOrders.get(6102)!.status = 20;
+    const wrongOrder = await stageCatalog(token, "po-wrong-line-parent", [{ key: "receipt", action: "receive_purchase_order", arguments: { ...receipt, order_id: 6102 } }]);
+    assert.match(wrongOrder.content[0].text, /does not belong/);
+    const finalReceipt = await stageCatalog(token, "po-receipt-then-edit", [
+      { key: "receipt", action: "receive_purchase_order", arguments: receipt },
+      { key: "edit", action: "update_purchase_order_line", arguments: { line_item_id: 6201, changes: { quantity: 101 } } },
+    ]);
+    assert.equal(finalReceipt.isError, true); assert.match(finalReceipt.content[0].text, /final action/);
+    assert.equal(purchaseWrites.length, before);
+    const incomplete = await stageCatalog(token, "po-explicit-complete", [{ key: "complete", action: "complete_purchase_order", arguments: { order_id: 6101, accept_incomplete: true } }]);
+    assert.match(incomplete.content[0].text, /does not create stock/);
+    assert.equal((await commitCatalog(token, incomplete)).structuredContent.data.status, "committed");
+    assert.equal(purchaseOrders.get(6101)!.status, 30); assert.equal(purchaseLines.get(6201)!.received, 40);
+    const cancelled = await stageCatalog(token, "po-cancel-pending", [{ key: "cancel", action: "cancel_purchase_order", arguments: { order_id: 1101 } }]);
+    assert.equal((await commitCatalog(token, cancelled)).structuredContent.data.status, "committed");
+    assert.equal(purchaseOrders.get(1101)!.status, 40);
+  });
+
+  it("rejects stale purchase-order or line snapshots before issuing or receiving", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    purchaseOrders.set(6301, { pk: 6301, reference: "PO-stale", supplier: 501, status: 20 });
+    purchaseLines.set(6401, { pk: 6401, order: 6301, part: 701, quantity: 100, received: 0 });
+    for (const [field, row] of [["description", purchaseOrders.get(6301)!], ["received", purchaseLines.get(6401)!]] as const) {
+      const staged = await stageCatalog(token, `po-stale-${field}`, [
+        { key: "rename", action: "update_purchase_order", arguments: { order_id: 6301, changes: { supplier_reference: "must not apply" } } },
+        { key: "receipt", action: "receive_purchase_order", arguments: { order_id: 6301, location_id: 81, items: [{ line_item_id: 6401, quantity: 1 }] } },
+      ]);
+      const before = purchaseWrites.length;
+      row[field] = field === "received" ? 1 : "concurrent edit";
+      const failed = await commitCatalog(token, staged);
+      assert.equal(failed.isError, true); assert.equal(failed.structuredContent.data.conflict_type, "stale_inventory");
+      assert.equal(purchaseWrites.length, before);
+      assert.equal(purchaseOrders.get(6301)!.supplier_reference, undefined);
+    }
+  });
+
+  it("reviews receipts using a supplier pack changed earlier in the plan", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    purchaseOrders.set(6501, { pk: 6501, reference: "PO-pack-change", supplier: 501, status: 20, destination: 81 });
+    purchaseLines.set(6601, { pk: 6601, order: 6501, part: 701, quantity: 1, received: 0 });
+    const supplier = catalog.get(catalogPaths.supplier_part)!.get(701)!;
+    const oldPack = supplier.pack_quantity;
+    try {
+      const staged = await stageCatalog(token, "po-ordered-pack-change", [
+        { key: "pack", action: "update_supplier_part", arguments: { supplier_part_id: 701, changes: { pack_quantity: "100" } } },
+        { key: "receipt", action: "receive_purchase_order", arguments: { order_id: 6501, items: [{ line_item_id: 6601, quantity: 1 }] } },
+      ]);
+      assert.match(staged.content[0].text, /1 supplier packs.*100/);
+      const committed = await commitCatalog(token, staged);
+      assert.equal(committed.structuredContent.data.status, "committed");
+      assert.equal([...purchaseStock.values()].find((item) => item.purchase_order === 6501)!.quantity, 100);
+    } finally { supplier.pack_quantity = oldPack; }
+  });
+
+  it("accepts the exact remaining fractional pack quantity without floating-point excess", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    purchaseOrders.set(6701, { pk: 6701, reference: "PO-fraction", supplier: 501, status: 20, destination: 81 });
+    purchaseLines.set(6801, { pk: 6801, order: 6701, part: 701, quantity: 0.3, received: 0.1 });
+    const staged = await stageCatalog(token, "po-fractional-remainder", [{ key: "receipt", action: "receive_purchase_order", arguments: {
+      order_id: 6701, items: [{ line_item_id: 6801, quantity: 0.2 }],
+    } }]);
+    assert.equal(staged.structuredContent.data.status, "staged");
+    assert.match(staged.content[0].text, /received 0.1 -> 0.3/);
+    assert.equal((await commitCatalog(token, staged)).structuredContent.data.status, "committed");
+  });
+
+  it("preserves serialized receipt status and reports an already-recorded receipt if correction fails", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    for (const fail of [false, true]) {
+      const orderId = fail ? 7902 : 7901;
+      const lineId = fail ? 8002 : 8001;
+      purchaseOrders.set(orderId, { pk: orderId, reference: `PO-serialized-${fail}`, supplier: 501, status: 20, destination: 81 });
+      purchaseLines.set(lineId, { pk: lineId, order: orderId, part: 701, quantity: 2, received: 0 });
+      const staged = await stageCatalog(token, `po-serialized-${fail}`, [{ key: "receipt", action: "receive_purchase_order", arguments: {
+        order_id: orderId, items: [{ line_item_id: lineId, quantity: 2, serial_numbers: "90001,90002", status: "quarantined" }],
+      } }]);
+      assert.equal(staged.structuredContent.data.status, "staged");
+      assert.match(staged.content[0].text, /receipt is already recorded/);
+      failReceiptStatusCorrection = fail;
+      try {
+        const committed = await commitCatalog(token, staged);
+        const stock = [...purchaseStock.values()].filter((item) => item.purchase_order === orderId);
+        assert.equal(stock.length, 2);
+        assert.deepEqual(stock.map((item) => item.status), fail ? [10, 10] : [75, 75]);
+        assert.equal(purchaseLines.get(lineId)!.received, 2);
+        if (fail) {
+          assert.equal(committed.isError, true);
+          assert.equal(committed.structuredContent.data.completed_operations, 1);
+          const review = await callTool(token, "review_inventory_plan", { plan_id: staged.structuredContent.data.plan_id });
+          assert.equal(review.structuredContent.data.status, "failed");
+          assert.deepEqual(review.structuredContent.data.commit_result.result_ids, stock.map((item) => item.pk));
+          const before = purchaseWrites.length;
+          assert.equal((await commitCatalog(token, staged)).isError, true);
+          assert.equal(purchaseWrites.length, before, "failed receipt replay must not duplicate stock");
+        } else {
+          assert.equal(committed.structuredContent.data.status, "committed");
+          const before = purchaseWrites.length;
+          await commitCatalog(token, staged);
+          assert.equal(purchaseWrites.length, before);
+        }
+      } finally { failReceiptStatusCorrection = false; }
+    }
+  });
+
+  it("rejects ambiguous serialized statuses for the same supplier part before receiving", async () => {
+    const token = await authorizeToken("inventree.read inventree.write");
+    purchaseOrders.set(7903, { pk: 7903, reference: "PO-mixed-status", supplier: 501, status: 20, destination: 81 });
+    for (const id of [8003, 8004]) purchaseLines.set(id, { pk: id, order: 7903, part: 701, quantity: 1, received: 0 });
+    const before = purchaseWrites.length;
+    const rejected = await stageCatalog(token, "po-mixed-status", [{ key: "receipt", action: "receive_purchase_order", arguments: {
+      order_id: 7903, items: [{ line_item_id: 8003, quantity: 1, serial_numbers: "90003", status: "quarantined" },
+        { line_item_id: 8004, quantity: 1, serial_numbers: "90004", status: "ok" }],
+    } }]);
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.content[0].text, /separate receipt plans/);
+    assert.equal(purchaseWrites.length, before);
+  });
+
+  let workflowClientId: string | undefined;
   async function authorizeToken(scope: string): Promise<string> {
     const redirectUri = "https://chatgpt.com/connector/oauth/workflow-test";
-    const registration = await request(app)
-      .post("/oauth/register")
-      .send({ client_name: "Workflow test", redirect_uris: [redirectUri] })
-      .expect(201);
-    const clientId = registration.body.client_id as string;
+    if (!workflowClientId) {
+      const registration = await request(app)
+        .post("/oauth/register")
+        .send({ client_name: "Workflow test", redirect_uris: [redirectUri] })
+        .expect(201);
+      workflowClientId = registration.body.client_id as string;
+    }
+    const clientId = workflowClientId;
     const verifier = "workflow-test-verifier-with-enough-entropy-01234567890";
     const authorization = await request(app)
       .get("/oauth/authorize")

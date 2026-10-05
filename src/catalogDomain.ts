@@ -36,6 +36,7 @@ export function normalizeSupplierPart(item: JsonRecord) {
     mpn: optionalString(item.MPN) ?? optionalString(manufacturerPart.MPN),
     description: optionalString(item.description), link: optionalString(item.link),
     packaging: optionalString(item.packaging), packQuantity: optionalString(item.pack_quantity) ?? item.pack_quantity,
+    packQuantityNative: item.pack_quantity_native,
     active: item.active };
 }
 

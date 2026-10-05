@@ -1,7 +1,7 @@
 ---
 name: inventree-inventory
 description: >-
-  Manage InvenTree inventory through its MCP connector: find parts by specifications, record purchases, migrate MPN-named parts, link manufacturers and supplier SKUs, and edit or reconcile stock.
+  Manage InvenTree inventory through its MCP connector: find parts by specifications, create and receive purchase orders, record purchases, migrate MPN-named parts, link manufacturers and supplier SKUs, and edit or reconcile stock.
 ---
 
 # InvenTree inventory
@@ -14,6 +14,7 @@ Use the connected InvenTree MCP tools to organize inventory around readable cano
 - **ManufacturerPart** links a canonical Part to a manufacturer company and an MPN. **SupplierPart** links it to a supplier company and SKU, optionally referencing a ManufacturerPart. These IDs are distinct from the canonical part ID.
 - **Parameters** store structured specifications using discovered template IDs and string values. Template units describe attributes; Part `units` describe stock quantities. A resistor's resistance is a parameter, not its stock unit.
 - **StockItem** is a concrete lot with quantity, location, and optional supplier provenance. Set the supplier part only on lots with known provenance. Renaming a Part does not establish where its stock came from.
+- **PurchaseOrder** belongs to a supplier; its lines refer to SupplierParts. Ordered and received quantities count supplier packs. `receive_purchase_order` converts those packs to canonical stock units and preserves the order link. Ordinary `receive_stock` already counts canonical units.
 
 ## Discover, stage, commit, verify
 
@@ -29,7 +30,7 @@ Use the connected InvenTree MCP tools to organize inventory around readable cano
 - **Migrate an existing MPN-named part:** keep the Part ID; `update_part` its name, preserve the original MPN on a ManufacturerPart, add/reuse a SupplierPart, `set_part_parameters`, and `update_stock` each known-source existing lot. Do not receive its quantity again. See the migration example in the reference.
 - **Record a new purchase:** reuse the canonical Part or create it, add/reuse its sourcing, set specifications, then `receive_stock`. For new sourced parts, use a part create without initial stock, followed by sourcing and a sourced receipt with `merge: "new_item"`.
 - **Edit stock:** use `update_stock` for supplier provenance, batch, packaging, expiry, notes, or link. Use `count_stock` for observed quantities, `move_stock` for physical relocation, and `set_stock_status` for condition. Omitted metadata is preserved.
-- **Inspect orders:** purchase/build tools are read-only. A normal receipt does not update purchase-order received quantities. Explain unsupported order lifecycle writes rather than silently substituting another workflow.
+- **Manage purchase orders:** discover the supplier and its SupplierParts, create or edit the order and lines, issue it, then receive deliveries with `receive_purchase_order`. Follow [references/purchase-orders.md](references/purchase-orders.md), or load `get_inventory_guide {section:"purchase_orders"}`. Ordinary `receive_stock` does not update an order. Build lifecycle writes remain unsupported.
 
 ## References and failures
 

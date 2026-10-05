@@ -83,13 +83,13 @@ export function registerSkills(server: McpServer, oauth: OAuthService): void {
   }
   server.registerTool("get_inventory_guide", {
     title: "Read the inventory workflow guide",
-    description: "Load the InvenTree skill before a complex sourcing, parameter, migration, or stock plan. Provides the same packaged skill and recipes for clients without MCP skill/resource support. This reads instructions only and never changes inventory.",
-    inputSchema: { section: z.enum(["overview", "workflows"]).default("overview") },
+    description: "Load the InvenTree skill before a complex sourcing, parameter, migration, stock, or purchase-order plan. Provides the same packaged skill and recipes for clients without MCP skill/resource support. This reads instructions only and never changes inventory.",
+    inputSchema: { section: z.enum(["overview", "workflows", "purchase_orders"]).default("overview") },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: { securitySchemes: READ_SECURITY },
   }, async (input, extra) => safely(oauth, async () => {
     requireAuth(extra.authInfo, "inventree.read");
-    const resource = input.section === "overview" ? skill.entry : skill.resources.find((item) => item.path === "references/workflows.md")!;
+    const resource = input.section === "overview" ? skill.entry : skill.resources.find((item) => item.path === `references/${input.section === "purchase_orders" ? "purchase-orders" : "workflows"}.md`)!;
     return result({ name, uri: resource.uri, digest: resource.digest, markdown: resource.text }, resource.text!);
   }));
 }

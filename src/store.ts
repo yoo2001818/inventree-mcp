@@ -53,6 +53,9 @@ export interface MutationRequest {
   body: unknown;
   // Newly created parts can inherit category parameters before setters run.
   parameterUpsert?: true;
+  purchaseReceipt?: true;
+  // Select newly serialized stock from an earlier receipt in the same step.
+  stockStatusFromReceipt?: { requestIndex: number };
   imageUpload?: {
     uploadRef: string;
     field: "image";
@@ -68,7 +71,7 @@ export interface MutationCheck {
 }
 
 export type InventoryEntityType = "part" | "stock_item" | "part_category" | "stock_location"
-  | "company" | "manufacturer_part" | "supplier_part" | "parameter_template";
+  | "company" | "manufacturer_part" | "supplier_part" | "parameter_template" | "purchase_order" | "purchase_order_line";
 
 export interface MutationOutput {
   ref: string;

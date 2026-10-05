@@ -42,6 +42,13 @@ Call `create_inventory_plan {operation_id,steps:[{key,action,arguments}]}`. Each
 | `create_parameter_template` | `name`, optional `units`, `choices`, `checkbox`, `enabled` | `parameter_template` |
 | `update_parameter_template` | `parameter_template_id`, sparse `changes` | None |
 | `set_part_parameters` | `part_id`, `parameters:[{template_id,data,note?}]` | None |
+| `create_purchase_order` | `supplier_id`, `reference`, optional destination, dates, currency, notes | `purchase_order` |
+| `update_purchase_order` | `order_id`, sparse `changes` | None |
+| `create_purchase_order_line` | `order_id`, `supplier_part_id`, `quantity`, optional price, currency, destination | `purchase_order_line` |
+| `update_purchase_order_line` | `line_item_id`, sparse `changes` | None |
+| `issue_purchase_order` / `hold_purchase_order` / `cancel_purchase_order` | `order_id` | None |
+| `complete_purchase_order` | `order_id`, optional `accept_incomplete` | None |
+| `receive_purchase_order` | `order_id`, `items:[{line_item_id,quantity,...}]`, optional `location_id`, `allow_over_receipt` | None |
 | `update_stock` | `stock_item_id`, `changes:{supplier_part_id?,batch?,packaging?,expiry_date?,notes?,link?}` | None |
 | `receive_stock` | `part_id`, `quantity`, `location_id`, optional `supplier_part_id`, `merge` | `stock_item` only when a new lot is created |
 | `count_stock` | `counts:[{stock_item_id,observed_quantity}]`, optional `location_id`, `notes` | None |
@@ -85,7 +92,7 @@ The response contains `plan_id`, `plan_version`, and a complete review. Commit t
 
 For a new sourced capacitor: create the Part without initial stock, create/reuse its ManufacturerPart and SupplierPart, set parameters, then receive stock with the canonical `part_id`, matching `supplier_part_id`, location, and quantity. Future Part/location refs require `merge:"new_item"`; compatible lookup cannot find entities that do not exist yet.
 
-For an existing Part, `merge:"compatible"` adds to a single matching lot or creates a new lot. Matching includes source provenance, batch, packaging, expiry, and eligible status. Multiple candidates require selecting a stock item or choosing `new_item`. `merge:"stock_item"` requires `stock_item_id` and rejects a different source. Unknown provenance and different supplier parts remain separate. Supplier `pack_quantity` never automatically multiplies receipt quantities: use canonical Part units and reconcile purchase totals explicitly.
+For an existing Part, `merge:"compatible"` adds to a single matching lot or creates a new lot. Matching includes source provenance, batch, packaging, expiry, and eligible status. Multiple candidates require selecting a stock item or choosing `new_item`. `merge:"stock_item"` requires `stock_item_id` and rejects a different source. Unknown provenance and different supplier parts remain separate. Ordinary `receive_stock` uses canonical Part units and never multiplies by supplier `pack_quantity`; dedicated purchase-order receipts use supplier-pack quantities and perform that conversion.
 
 For consumption, specify a stock item/location or a deliberate `fewest_items` or `oldest_first` strategy when multiple locations exist. Only available eligible quantities can be consumed. For a partial move, InvenTree can split the lot and assign another stock ID; discover the resulting placements afterward instead of assuming the source ID describes the moved quantity.
 
@@ -93,6 +100,6 @@ For a physical count, use the observed absolute quantity, not a calculated recei
 
 ## Orders and incomplete commits
 
-Purchase order reads distinguish canonical `line.part.id` from `line.supplierPartId`; quantities include ordered and received. Build reads show BOM-derived requirements, allocation, and consumption. Lifecycle writes, purchase receipt against a specific order line, and build allocation/completion are unsupported. Ordinary `receive_stock` does not advance an order.
+Purchase order reads distinguish canonical `line.part.id` from `line.supplierPartId`; quantities include ordered and received supplier packs. Purchase order creation, edits, transitions, and receipts use dedicated staged actions. Load [purchase-orders.md](purchase-orders.md), or `get_inventory_guide {section:"purchase_orders"}`, before constructing a plan. Build reads show BOM-derived requirements, allocation, and consumption; build allocation/completion remain unsupported. Ordinary `receive_stock` does not advance an order.
 
 On an upstream failure, examine the failed step and the completed operation count, then read the affected records. Preserve created entities by reusing their resolved IDs. A corrected plan uses a new operation ID and only the remaining changes. On a transport failure with an uncertain outcome, retry the same plan commit; never create a fresh receipt just because its response was lost. On stale inventory, the previous preconditions no longer apply: reread, restage, and review the new result before executing it.

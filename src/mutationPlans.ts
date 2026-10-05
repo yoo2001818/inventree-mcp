@@ -74,7 +74,8 @@ function opaqueId(prefix: string): string {
 
 function outputPrefix(entityType: InventoryEntityType): string {
   return { part: "part", stock_item: "stock", part_category: "category", stock_location: "location",
-    company: "company", manufacturer_part: "manufacturer", supplier_part: "supplier", parameter_template: "template" }[entityType];
+    company: "company", manufacturer_part: "manufacturer", supplier_part: "supplier", parameter_template: "template",
+    purchase_order: "po", purchase_order_line: "po_line" }[entityType];
 }
 
 export function stagePlan(
@@ -276,6 +277,11 @@ export function reviewPlan(oauth: OAuthService, authInfo: AuthInfo, planId: stri
         ...step.outputs.map((output) => `   Output: ${output.display} (ref ${output.ref})`),
       ]),
       `\nTotal upstream operations: ${plan.steps.reduce((count, step) => count + step.requests.length, 0)}`,
+      ...(plan.commitResult ? [
+        `Recorded commit: ${plan.commitResult.completedSteps} completed steps, ${plan.commitResult.completedRequests} completed upstream operations.`,
+        `Affected IDs: ${plan.commitResult.resultIds.join(", ") || "none recorded"}.`,
+        ...(plan.commitResult.error ? [`Failure: ${plan.commitResult.error}`] : []),
+      ] : []),
     ].join("\n"),
   };
 }
@@ -339,8 +345,20 @@ export async function commitPlan(
     const stepResults: unknown[] = [];
     for (let requestIndex = 0; requestIndex < step.requests.length; requestIndex += 1) {
       const request = step.requests[requestIndex]!;
-      const body = resolveReferences(request.body, stepResults, refs);
       try {
+        let body = resolveReferences(request.body, stepResults, refs);
+        if (request.stockStatusFromReceipt) {
+          const receipt = stepResults[request.stockStatusFromReceipt.requestIndex];
+          if (!Array.isArray(receipt)) throw new Error("Cannot verify serialized stock: receipt did not return its created stock items");
+          const desired = record(body);
+          const sources = desired.supplier_parts as number[];
+          const items = receipt.map(record).filter((item) => sources.includes(numberValue(item.supplier_part))
+            && item.serial != null && item.serial !== "" && numberValue(item.status) !== desired.status)
+            .map((item) => numberValue(item.pk));
+          if (items.some((id) => id <= 0)) throw new Error("Cannot identify newly serialized stock for status correction");
+          if (!items.length) { stepResults.push([]); continue; }
+          body = { items, status: desired.status, note: "Preserve requested purchase receipt status" };
+        }
         const requestPath = resolveRequestPath(request.path, refs);
         const upload = request.imageUpload
           ? imageUploads?.get(request.imageUpload.uploadRef, credentialsId(authInfo))
@@ -357,6 +375,12 @@ export async function commitPlan(
             ? await writeParameterUpsert(client, requestPath, body)
             : await client.write(request.method, requestPath, body);
         completedRequests += 1;
+        if (request.purchaseReceipt) {
+          for (const item of (Array.isArray(response) ? response.map(record) : pageResults(response))) {
+            const id = numberValue(item.pk);
+            if (id > 0) resultIds.push(id);
+          }
+        }
         if (upload) {
           const responseRecord = response !== null && typeof response === "object"
             ? response as Record<string, unknown>

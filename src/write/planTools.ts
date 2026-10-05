@@ -34,10 +34,15 @@ const PLAN_ACTION_GUIDE = [
   "create_supplier_part {part_id,supplier_id,SKU,manufacturer_part_id?,...}; update_supplier_part {supplier_part_id,changes};",
   "create_parameter_template {name,units?,choices?,...}; update_parameter_template {parameter_template_id,changes};",
   "set_part_parameters {part_id,parameters:[{template_id,data,note?}]}; receive_stock optionally accepts supplier_part_id.",
+  "create_purchase_order {supplier_id,reference,...}; update_purchase_order {order_id,changes};",
+  "create_purchase_order_line {order_id,supplier_part_id,quantity,...}; update_purchase_order_line {line_item_id,changes};",
+  "issue_purchase_order/hold_purchase_order/cancel_purchase_order {order_id}; complete_purchase_order {order_id,accept_incomplete?};",
+  "receive_purchase_order {order_id,items:[{line_item_id,quantity,location_id?,...}],location_id?,allow_over_receipt?}; order quantities are supplier-pack quantities, not canonical stock units; receiving must be the final action for that order in the plan.",
   "Exact outputs (never append _id): create_part_with_stock -> part, plus stock_item only with initial_stock;",
   "receive_stock -> stock_item only when it creates a new item (use merge:new_item when a later step requires it);",
   "create_part_category -> part_category; create_stock_location -> stock_location; create_company -> company;",
-  "create_manufacturer_part -> manufacturer_part; create_supplier_part -> supplier_part; create_parameter_template -> parameter_template; all other actions -> no outputs.",
+  "create_manufacturer_part -> manufacturer_part; create_supplier_part -> supplier_part; create_parameter_template -> parameter_template;",
+  "create_purchase_order -> purchase_order; create_purchase_order_line -> purchase_order_line; all other actions -> no outputs.",
   "Reference example: {step:\"part\",output:\"stock_item\"}, where step is the exact earlier step key.",
 ].join(" ");
 
@@ -275,6 +280,14 @@ export function registerInventoryPlanTools(
             status: reviewed.plan.state === "staging" ? "staged" : reviewed.plan.state,
             plan_id,
             plan_version: reviewed.plan.version,
+            ...(reviewed.plan.commitResult ? { commit_result: {
+              completed_steps: reviewed.plan.commitResult.completedSteps,
+              completed_requests: reviewed.plan.commitResult.completedRequests,
+              resolved_refs: reviewed.plan.commitResult.resolvedRefs,
+              result_ids: reviewed.plan.commitResult.resultIds,
+              failed_step_id: reviewed.plan.commitResult.failedStepId,
+              error: reviewed.plan.commitResult.error,
+            } } : {}),
             steps: reviewed.plan.steps.map((step, index) => ({
               position: index + 1,
               step_id: step.id,

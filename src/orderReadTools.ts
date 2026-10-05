@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { requiredCatalogRecord } from "./catalogReadTools.js";
-import { decodeCursor, entityRef, formatRef, numberValue, optionalString, page, pageResults, record, type JsonRecord } from "./inventoryDomain.js";
+import { decodeCursor, entityRef, formatRef, normalizeStock, numberValue, optionalString, page, pageResults, record, type JsonRecord } from "./inventoryDomain.js";
 import { clientFor, READ_SECURITY, result, safely } from "./mcpSupport.js";
 import type { OAuthService } from "./oauth.js";
 
@@ -16,14 +16,17 @@ function normalizeOrder(item: JsonRecord, kind: "purchase" | "build") {
     part: kind === "build" ? entityRef(item.part_detail) ?? { id: numberValue(item.part), name: String(item.part_name ?? `Part ${item.part}`) } : undefined,
     quantity: kind === "build" ? numberValue(item.quantity) : undefined,
     completed: kind === "build" ? numberValue(item.completed) : undefined,
-    targetDate: optionalString(item.target_date), supplierReference: optionalString(item.supplier_reference) };
+    targetDate: optionalString(item.target_date), supplierReference: optionalString(item.supplier_reference),
+    ...(kind === "purchase" ? { currency: optionalString(item.order_currency),
+      destinationId: item.destination ?? null, responsibleId: item.responsible ?? null,
+      totalPrice: item.total_price == null ? null : String(item.total_price) } : {}) };
 }
 
 export function registerOrderReadTools(server: McpServer, oauth: OAuthService) {
   for (const kind of ["purchase", "build"] as const) {
     const path = kind === "purchase" ? "/api/order/po/" : "/api/build/";
     server.registerTool(`list_${kind}_orders`, {
-      title: `Find ${kind} orders`, description: `Read-only ${kind} order lookup with status and canonical part context. Order lifecycle mutations are not supported yet.`,
+      title: `Find ${kind} orders`, description: `Read-only ${kind} order lookup with status and canonical part context. ${kind === "purchase" ? "Purchase-order writes use typed inventory-plan actions." : "Build lifecycle mutations are not supported yet."}`,
       inputSchema: { query: z.string().optional(), part_id: id().optional(),
         ...(kind === "purchase" ? { supplier_id: id().optional(), supplier_part_id: id().optional() } : {}),
         status: z.number().int().nonnegative().optional(), outstanding: z.boolean().optional(), ...paging },
@@ -43,15 +46,18 @@ export function registerOrderReadTools(server: McpServer, oauth: OAuthService) {
     server.registerTool(`get_${kind}_order`, {
       title: `Inspect a ${kind} order`,
       description: `Read one ${kind} order and a page of ${kind === "purchase" ? "supplier-part line items with canonical part IDs" : "required component lines with allocated and consumed quantities"}. This tool does not receive stock, allocate components, or change order state.`,
-      inputSchema: { order_id: id(), ...paging }, annotations, _meta: { securitySchemes: READ_SECURITY },
+      inputSchema: { order_id: id(), ...paging,
+        ...(kind === "purchase" ? { include_received_stock: z.boolean().default(false), stock_cursor: z.string().optional(),
+          include_notes: z.boolean().default(false) } : {}) }, annotations, _meta: { securitySchemes: READ_SECURITY },
     }, async (input, extra) => safely(oauth, async () => {
       const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
-      const order = normalizeOrder(await requiredCatalogRecord(client, path, `${kind}_order`, input.order_id,
-        `list_${kind}_orders`, { supplier_detail: true, part_detail: true }), kind);
+      const rawOrder = await requiredCatalogRecord(client, path, `${kind}_order`, input.order_id,
+        `list_${kind}_orders`, { supplier_detail: true, part_detail: true });
+      const order = { ...normalizeOrder(rawOrder, kind), ...(input.include_notes ? { notes: rawOrder.notes ?? "" } : {}) };
       const offset = decodeCursor(input.cursor);
       const source = await client.get(kind === "purchase" ? "/api/order/po-line/" : "/api/build/line/", {
         ...(kind === "purchase" ? { order: input.order_id } : { build: input.order_id }),
-        part_detail: true, limit: input.limit, offset, ordering: "pk" });
+        part_detail: true, supplier_part_detail: true, limit: input.limit, offset, ordering: "pk" });
       const lines = page(source, pageResults(source).map((item) => {
         const supplier = record(item.supplier_part_detail);
         return { id: numberValue(item.pk),
@@ -62,12 +68,30 @@ export function registerOrderReadTools(server: McpServer, oauth: OAuthService) {
           mpn: kind === "purchase" ? optionalString(item.mpn ?? supplier.MPN) : undefined,
           quantity: numberValue(item.quantity), received: kind === "purchase" ? numberValue(item.received) : undefined,
           allocated: kind === "build" ? numberValue(item.allocated) : undefined,
-          consumed: kind === "build" ? numberValue(item.consumed) : undefined };
+          consumed: kind === "build" ? numberValue(item.consumed) : undefined,
+          ...(kind === "purchase" ? { outstanding: Math.max(0, numberValue(item.quantity) - numberValue(item.received)),
+            purchasePrice: item.purchase_price == null ? null : String(item.purchase_price),
+            currency: optionalString(item.purchase_price_currency), discount: numberValue(item.discount),
+            packQuantity: optionalString(supplier.pack_quantity), packQuantityNative: supplier.pack_quantity_native,
+            destinationId: item.destination ?? null, targetDate: optionalString(item.target_date),
+            ...(input.include_notes ? { notes: item.notes ?? "" } : {}) } : {}) };
       }), offset);
-      return result({ order, lines }, [`${order.reference} (#${order.id}) — ${order.statusText ?? order.status}`,
+      const stockOffset = kind === "purchase" && input.include_received_stock ? decodeCursor(input.stock_cursor) : 0;
+      const stockSource = kind === "purchase" && input.include_received_stock ? await client.get("/api/stock/", {
+        purchase_order: input.order_id, part_detail: true, location_detail: true, path_detail: true,
+        limit: input.limit, offset: stockOffset, ordering: "pk",
+      }) : undefined;
+      const receivedStock = stockSource === undefined ? undefined : page(stockSource, pageResults(stockSource).map((item) => ({
+        ...normalizeStock(item), part: entityRef(item.part_detail) ?? { id: numberValue(item.part), name: `Part ${item.part}` },
+        purchasePrice: item.purchase_price == null ? null : String(item.purchase_price), currency: optionalString(item.purchase_price_currency),
+      })), stockOffset);
+      return result({ order, lines, ...(receivedStock ? { receivedStock } : {}) }, [`${order.reference} (#${order.id}) — ${order.statusText ?? order.status}`,
         `Lines: ${lines.results.length} shown of ${lines.count}`,
-        ...lines.results.map((item) => `- ${formatRef(item.part)} [line #${item.id}${item.supplierPartId ? `; supplier part #${item.supplierPartId}` : ""}] — quantity ${item.quantity}${kind === "purchase" ? `; received ${item.received}${item.sku ? `; SKU ${item.sku}` : ""}${item.mpn ? `; MPN ${item.mpn}` : ""}` : `; allocated ${item.allocated}; consumed ${item.consumed}`}`),
-        ...(lines.nextCursor ? [`Next cursor: ${lines.nextCursor}`] : [])].join("\n"));
+        ...lines.results.map((item) => `- ${formatRef(item.part)} [line #${item.id}${item.supplierPartId ? `; supplier part #${item.supplierPartId}` : ""}] — quantity ${item.quantity}${kind === "purchase" ? `; received ${item.received} (supplier packs)${item.sku ? `; SKU ${item.sku}` : ""}${item.mpn ? `; MPN ${item.mpn}` : ""}${item.purchasePrice != null ? `; price ${item.purchasePrice} ${item.currency ?? ""} per pack` : ""}` : `; allocated ${item.allocated}; consumed ${item.consumed}`}`),
+        ...(lines.nextCursor ? [`Next line cursor: ${lines.nextCursor}`] : []),
+        ...(receivedStock ? [`Received stock: ${receivedStock.results.length} shown of ${receivedStock.count}`,
+          ...receivedStock.results.map((item) => `- ${formatRef(item.part)} [stock #${item.stockItemId}; supplier part #${item.supplierPartId}] — ${item.quantity} ${item.units ?? "canonical units"} in ${formatRef(item.location)}`),
+          ...(receivedStock.nextCursor ? [`Next stock cursor: ${receivedStock.nextCursor}`] : [])] : [])].join("\n"));
     }));
   }
 }

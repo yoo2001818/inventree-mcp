@@ -11,7 +11,7 @@ This document defines the MCP tool surface for using InvenTree as a personal par
 - "Create a category for JST connectors."
 - "Print labels for the new bins."
 
-Canonical parts, physical stock, sourcing companies, manufacturer parts, supplier parts, and part parameters are supported. Purchase and build orders support read-only lookup and detail inspection. Sales, customers, BOM editing, purchasing receipts, and build allocation/completion remain future workflows. The current sourcing contracts and examples are in [SOURCING_AND_PARAMETERS.md](SOURCING_AND_PARAMETERS.md).
+Canonical parts, physical stock, sourcing companies, manufacturer parts, supplier parts, and part parameters are supported. Purchase orders support lookup, detail/receipt inspection, staged creation and edits, issue/hold/cancel/complete transitions, and dedicated stock receipts. Build orders remain read-only. Sales, customers, BOM editing, and build allocation/completion remain future workflows. Current contracts are in [SOURCING_AND_PARAMETERS.md](SOURCING_AND_PARAMETERS.md) and the [purchase-order recipe](../skills/inventree-inventory/references/purchase-orders.md).
 
 The source material is:
 
@@ -340,7 +340,7 @@ Suggested intent:
 }
 ```
 
-Part creation and updates expose `assembly`, `component`, and `purchaseable` when needed; defaults remain `false`, `true`, and `true` respectively. Supplier and manufacturer identifiers belong on separate linked records. Sales, pricing, and revision workflows remain outside this profile. Before preparing the write, the server should run a duplicate search using name, IPN, and keywords and return candidates if found.
+Part creation and updates expose `assembly`, `component`, and `purchaseable` when needed; defaults remain `false`, `true`, and `true` respectively. Supplier and manufacturer identifiers belong on separate linked records. Purchase prices belong on purchase-order lines; sales and part-revision workflows remain outside this profile. Before preparing the write, the server should run a duplicate search using name, IPN, and keywords and return candidates if found.
 
 `units` is optional and should normally be omitted for ordinary individually counted household items. It is not a free-form display label: when explicitly needed, it must be a formal measurement or counting unit configured in InvenTree, such as `m`, `kg`, `L`, `piece`, `each`, `dozen`, `hundred`, or `thousand`. Never send localized counting words, arbitrary item nouns, or packaging descriptions as units. If supplied, the connector validates the exact value against `/api/units/all/` before creating a plan; invalid units therefore cannot cause a partially committed create workflow.
 
@@ -599,8 +599,8 @@ Some MCP clients preserve the complete JSON Schema but render a large nested act
 - Action arguments never contain `plan_id`, `expected_version`, or their own `operation_id`.
 - Step keys are unique, short request-local identifiers.
 - Steps execute in array order and may reference only earlier outputs.
-- `step` is the exact `key` of an earlier step. `output` is an exact semantic entity name, never an `_id` field: `part`, `stock_item`, `part_category`, or `stock_location`.
-- `create_part_with_stock` declares `part` and declares `stock_item` only when `initial_stock` is present. `receive_stock` declares `stock_item` only when it creates a new stock item; use `merge: "new_item"` when a later step requires that output. `create_part_category` declares `part_category`, and `create_stock_location` declares `stock_location`. Other actions declare no outputs.
+- `step` is the exact `key` of an earlier step. `output` is an exact semantic entity name, never an `_id` field: `part`, `stock_item`, `part_category`, `stock_location`, `company`, `manufacturer_part`, `supplier_part`, `parameter_template`, `purchase_order`, or `purchase_order_line`.
+- `create_part_with_stock` declares `part` and declares `stock_item` only when `initial_stock` is present. `receive_stock` declares `stock_item` only when it creates a new stock item; use `merge: "new_item"` when a later step requires that output. Category/location/catalog creates declare their corresponding entity names; `create_purchase_order` declares `purchase_order`, and `create_purchase_order_line` declares `purchase_order_line`. Updates, lifecycle transitions, and `receive_purchase_order` declare no outputs.
 - Every action is validated using the same private compiler used for single-step plans.
 - If any action fails validation, the server discards temporary staged state and returns no usable plan.
 - Steps that prove already current may be listed in `skipped_steps`; if every step is already current, no plan is created.
@@ -823,7 +823,7 @@ After these are proven, disable `inventree_write` by default. Keep it behind an 
 
 - Remove `get_part_bom` from the default home-inventory profile.
 - Keep `inventree_get` as an advanced read-only escape hatch with a clearly documented raw result.
-- Keep order lifecycle mutations and sales tools out of this profile until their dedicated workflows are implemented. Compact purchase/build order reads and sourcing tools are supported.
+- Purchase-order lifecycle writes use dedicated staged actions, including supplier-pack quantities, pricing, and order-linked receipts. Build lifecycle mutations and sales tools remain outside this profile. Compact purchase/build order reads and sourcing tools are supported.
 
 ## Implementation notes
 

@@ -10,6 +10,7 @@ import { registerStockPrimitives } from "./write/stockPrimitives.js";
 import { registerStockEditing } from "./write/stockEditing.js";
 import { registerStructurePrimitives } from "./write/structurePrimitives.js";
 import { registerCatalogPrimitives } from "./write/catalogPrimitives.js";
+import { registerPurchaseOrderPrimitives } from "./write/purchaseOrderPrimitives.js";
 
 export function registerWriteTools(
   server: McpServer,
@@ -20,6 +21,7 @@ export function registerWriteTools(
 
   registerPartPrimitives(primitives, oauth);
   registerCatalogPrimitives(primitives, oauth);
+  registerPurchaseOrderPrimitives(primitives, oauth);
   registerImageWriteTools(server, primitives, oauth, imageUploads);
   registerStockPrimitives(primitives, oauth);
   registerStockEditing(primitives, oauth);

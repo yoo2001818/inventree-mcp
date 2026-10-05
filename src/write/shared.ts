@@ -25,11 +25,11 @@ import type {
 } from "../store.js";
 export const positiveQuantity = z.number().positive().finite();
 export const optionalText = () => z.string().max(50_000).nullable().optional();
-export const localPlanOutputNames = ["part", "stock_item", "part_category", "stock_location", "company", "manufacturer_part", "supplier_part", "parameter_template"] as const;
+export const localPlanOutputNames = ["part", "stock_item", "part_category", "stock_location", "company", "manufacturer_part", "supplier_part", "parameter_template", "purchase_order", "purchase_order_line"] as const;
 export const localPlanRefSchema = z.object({
   step: z.string().min(1).max(64).describe("Exact key of an earlier step in this create_inventory_plan request"),
   output: z.enum(localPlanOutputNames).describe(
-    "Exact declared output name: part, stock_item, part_category, stock_location, company, manufacturer_part, supplier_part, or parameter_template; never append _id.",
+    "Exact declared output name: part, stock_item, part_category, stock_location, company, manufacturer_part, supplier_part, parameter_template, purchase_order, or purchase_order_line; never append _id.",
   ),
 }).strict().describe("Reference to an entity output declared by an earlier step");
 export const partUnitsSchema = z.string().trim().min(1).max(20).nullable().optional().describe(

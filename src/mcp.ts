@@ -13,7 +13,7 @@ export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUplo
   const server = new McpServer(
     { name: "inventree-mcp", version: "0.3.0" },
     {
-      instructions: "Before complex inventory changes, load get_inventory_guide (overview, then workflows as needed), or the inventree-inventory skill via skills/list and resources/read. Use readable canonical Part names, ManufacturerParts for MPNs, SupplierParts for SKUs, and parameters for specifications. Preserve existing Part and StockItem IDs during migration. Stage typed inventory plans, review the concrete changes, commit authorized plans, then verify. Purchase/build order tools are read-only.",
+      instructions: "Before complex inventory changes, load get_inventory_guide (overview, then workflows as needed), or the inventree-inventory skill via skills/list and resources/read. Use readable canonical Part names, ManufacturerParts for MPNs, SupplierParts for SKUs, and parameters for specifications. Stage, review, commit authorized plans, then verify. Purchase-order receipts use supplier-pack quantities and dedicated receive_purchase_order actions. Preserve existing IDs when migrating. Build orders remain read-only.",
     },
   );
 

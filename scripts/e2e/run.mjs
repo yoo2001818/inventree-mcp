@@ -69,6 +69,27 @@ async function commit(staged) {
   assert.equal(outcome.structuredContent.data.status, "committed");
   return outcome;
 }
+async function stageAndCommit(label, steps) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const staged = await stage(`${label}-attempt-${attempt}`, steps);
+    const data = staged.structuredContent.data;
+    assert.equal(data.status, "staged");
+    const done = await tool("commit_inventory_plan", { plan_id: data.plan_id, expected_version: data.plan_version }, { allowError: true });
+    if (!done.isError) {
+      assert.equal(done.structuredContent.data.status, "committed");
+      return [staged, done];
+    }
+    // Completing a PO schedules background pricing updates. A preflight stale
+    // rejection guarantees zero writes; restage only that specific conflict.
+    // Never retry a partially applied or otherwise failed mutation as new work.
+    const error = done.structuredContent.data;
+    if (error.conflict_type !== "stale_inventory") throw new Error(done.content.map((item) => item.text).join("\n"));
+    (report.restages ??= []).push({ label, attempt, changedPath: error.changed_path });
+    console.log(`RESTAGE ${label}: upstream background change at ${error.changed_path}`);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`${label}: upstream state continued changing across four reviewed snapshots`);
+}
 function resolved(staged, committed, step, output) {
   return Number(committed.structuredContent.data.resolved_refs[staged.structuredContent.data.aliases[step][output]]);
 }
@@ -160,7 +181,7 @@ try {
       textByUri.set(resource.uri, contents[0].text);
     }
     assert.deepEqual(manifest.frontmatter, parse(/^---\n([\s\S]*?)\n---/.exec(textByUri.get(manifest.uri))[1]));
-    for (const [section, uri] of [["overview", manifest.uri], ["workflows", `${baseUri}references/workflows.md`]]) {
+    for (const [section, uri] of [["overview", manifest.uri], ["workflows", `${baseUri}references/workflows.md`], ["purchase_orders", `${baseUri}references/purchase-orders.md`]]) {
       const guide = await tool("get_inventory_guide", { section }, { token: readOnly.access_token });
       assert.equal(guide.structuredContent.data.markdown, textByUri.get(uri));
       assert.equal(guide.structuredContent.data.digest, manifest.resources.find((item) => item.uri === uri).digest);
@@ -250,7 +271,15 @@ try {
     const sourcing = (await tool("get_part_sourcing", { part_id: report.ids.part })).structuredContent.data;
     assert.equal(sourcing.manufacturerParts.results[0].id, report.ids.mpn);
     assert.equal(sourcing.supplierParts.results[0].manufacturerPartId, report.ids.mpn);
-    for (const query of ["C57112", "0603B103K500NT"]) assert.ok(results(await tool("find_parts", { query })).some((item) => item.id === report.ids.part));
+    for (const query of ["C57112", "0603B103K500NT"]) {
+      let cursor, found = false;
+      do {
+        const page = (await tool("find_parts", { query, ...(cursor ? { cursor } : {}) })).structuredContent.data;
+        found = page.results.some((item) => item.id === report.ids.part);
+        cursor = page.nextCursor;
+      } while (!found && cursor);
+      assert.ok(found, `Current fixture was not discoverable by ${query}`);
+    }
     assert.equal(results(await tool("list_companies", { query: prefix, role: "supplier" }))[0].id, report.ids.supplier);
     assert.equal((await tool("list_parameter_templates", { query: prefix })).structuredContent.data.count, 4);
   });
@@ -448,19 +477,169 @@ try {
       assert.equal(Number(stock.quantity), quantity); assert.equal(stock.notes, notes); assert.equal(stock.supplier_part, sku);
     }
   });
-  await check("Purchase order lookup preserves supplier-part and canonical-part IDs", async () => {
-    // Seed read-only order fixtures through InvenTree, rather than adding an
-    // unimplemented order write tool to the MCP surface.
-    const order = await api("/api/order/po/", { method: "POST", body: { reference: `PO-${Date.now()}`, supplier: report.ids.supplier, description: `${prefix} capacitor order` } });
-    const line = await api("/api/order/po-line/", { method: "POST", body: { order: order.pk, part: report.ids.sku, quantity: 100 } });
-    report.ids.purchaseOrder = order.pk; report.ids.purchaseLine = line.pk;
+  let purchase, purchaseCommit;
+  const poReference = `PO-${Date.now()}`;
+  await check("Stage, edit, and commit a draft PO with two separate supplier-pack lines", async () => {
+    purchase = await stage("purchase-create", [
+      { key: "source", action: "create_supplier_part", arguments: { part_id: report.ids.part, supplier_id: report.ids.supplier,
+        manufacturer_part_id: report.ids.mpn, SKU: `${prefix} Pack100`, pack_quantity: "100" } },
+      { key: "order", action: "create_purchase_order", arguments: { reference: poReference, supplier_id: report.ids.supplier,
+        destination_id: report.ids.location, order_currency: "USD", description: `${prefix} capacitor order`, notes: "keep order notes" } },
+      { key: "line", action: "create_purchase_order_line", arguments: { order_id: ref("order", "purchase_order"), supplier_part_id: ref("source", "supplier_part"),
+        quantity: 3, purchase_price: "12.500000", purchase_price_currency: "USD", notes: "keep line notes" } },
+      { key: "quantity", action: "update_purchase_order_line", arguments: { line_item_id: ref("line", "purchase_order_line"), changes: { quantity: 4 } } },
+      { key: "line2", action: "create_purchase_order_line", arguments: { order_id: ref("order", "purchase_order"), supplier_part_id: ref("source", "supplier_part"),
+        quantity: 1, purchase_price: "12.500000", purchase_price_currency: "USD", notes: "separate delivery line" } },
+      { key: "meta", action: "update_purchase_order", arguments: { order_id: ref("order", "purchase_order"), changes: { supplier_reference: `${prefix} Supplier order` } } },
+    ]);
+    assert.equal((await api(`/api/order/po/?limit=100&search=${encodeURIComponent(poReference)}`)).count, 0, "Staging created the purchase order");
+    purchaseCommit = await commit(purchase);
+    report.ids.purchaseOrder = resolved(purchase, purchaseCommit, "order", "purchase_order");
+    report.ids.purchaseLine = resolved(purchase, purchaseCommit, "line", "purchase_order_line");
+    report.ids.purchaseLine2 = resolved(purchase, purchaseCommit, "line2", "purchase_order_line");
+    report.ids.purchaseSku = resolved(purchase, purchaseCommit, "source", "supplier_part");
+    assert.notEqual(report.ids.purchaseLine, report.ids.purchaseLine2, "New purchase lines merged silently");
     const found = results(await tool("list_purchase_orders", { supplier_id: report.ids.supplier, part_id: report.ids.part }));
-    assert.ok(found.some((item) => item.id === order.pk));
-    const detail = (await tool("get_purchase_order", { order_id: order.pk })).structuredContent.data;
-    assert.equal(detail.lines.results[0].supplierPartId, report.ids.sku);
-    assert.equal(detail.lines.results[0].part.id, report.ids.part);
-    assert.equal(detail.lines.results[0].sku, "C57112");
-    assert.equal(detail.lines.results[0].quantity, 100);
+    assert.ok(found.some((item) => item.id === report.ids.purchaseOrder));
+    const detail = (await tool("get_purchase_order", { order_id: report.ids.purchaseOrder, include_notes: true })).structuredContent.data;
+    assert.equal(detail.order.status, 10); assert.equal(detail.lines.count, 2);
+    assert.equal(detail.order.notes, "keep order notes");
+    const line = detail.lines.results.find((item) => item.id === report.ids.purchaseLine);
+    assert.equal(line.quantity, 4); assert.equal(line.notes, "keep line notes");
+    assert.equal(Number(line.purchasePrice), 12.5); assert.equal(line.currency, "USD");
+    assert.equal(line.supplierPartId, report.ids.purchaseSku); assert.equal(line.part.id, report.ids.part);
+    assert.equal(line.packQuantityNative, 100);
+    const unchanged = await stage("po-current-metadata", [{ key: "meta", action: "update_purchase_order", arguments: { order_id: report.ids.purchaseOrder, changes: { notes: "keep order notes" } } }]);
+    assert.equal(unchanged.structuredContent.data.status, "already_current");
+    const samePrice = await stage("po-current-price", [{ key: "price", action: "update_purchase_order_line", arguments: {
+      line_item_id: report.ids.purchaseLine, changes: { purchase_price: "12.500000" },
+    } }]);
+    assert.equal(samePrice.structuredContent.data.status, "already_current");
+  });
+  await check("Hold, issue, and partially receive PO lines with pack conversion and idempotent replay", async () => {
+    const receipt = await stage("purchase-first-receipt", [
+      { key: "hold", action: "hold_purchase_order", arguments: { order_id: report.ids.purchaseOrder } },
+      { key: "issue", action: "issue_purchase_order", arguments: { order_id: report.ids.purchaseOrder } },
+      { key: "receive", action: "receive_purchase_order", arguments: { order_id: report.ids.purchaseOrder, items: [
+        { line_item_id: report.ids.purchaseLine, quantity: 2, batch: `${prefix} Delivery1`, packaging: "reel", notes: "receipt note", expiry_date: "2030-01-01" },
+        { line_item_id: report.ids.purchaseLine2, quantity: 1 },
+      ] } },
+    ]);
+    assert.match(receipt.content[0].text, /2 supplier packs.*200/);
+    assert.equal((await api(`/api/order/po/${report.ids.purchaseOrder}/`)).status, 10, "Staging issued the order");
+    assert.equal((await api(`/api/stock/?limit=100&purchase_order=${report.ids.purchaseOrder}`)).count, 0);
+    await commit(receipt); await commit(receipt);
+    const detail = (await tool("get_purchase_order", { order_id: report.ids.purchaseOrder, include_received_stock: true, limit: 1 })).structuredContent.data;
+    assert.equal(detail.order.status, 20); assert.equal(detail.lines.count, 2); assert.ok(detail.lines.nextCursor);
+    assert.equal(detail.lines.results[0].received, 2); assert.equal(detail.lines.results[0].outstanding, 2);
+    assert.equal(detail.receivedStock.count, 2); assert.ok(detail.receivedStock.nextCursor);
+    assert.ok([100, 200].includes(detail.receivedStock.results[0].quantity)); assert.equal(detail.receivedStock.results[0].supplierPartId, report.ids.purchaseSku);
+    assert.equal(detail.receivedStock.results[0].part.id, report.ids.part);
+    assert.equal(Number(detail.receivedStock.results[0].purchasePrice), 0.125);
+    const next = (await tool("get_purchase_order", { order_id: report.ids.purchaseOrder, include_received_stock: true,
+      limit: 1, cursor: detail.lines.nextCursor, stock_cursor: detail.receivedStock.nextCursor })).structuredContent.data;
+    assert.equal(next.lines.results[0].received, 1);
+    assert.deepEqual([detail.receivedStock.results[0].quantity, next.receivedStock.results[0].quantity].sort((a,b) => a-b), [100,200]);
+    const stored = (await api(`/api/stock/?limit=100&purchase_order=${report.ids.purchaseOrder}`)).results.find((item) => Number(item.quantity) === 200);
+    assert.equal(stored.notes, "receipt note"); assert.equal(stored.expiry_date, "2030-01-01"); assert.equal(stored.packaging, "reel");
+  });
+  await check("Final PO delivery reconciles 500 canonical units and automatically completes the order", async () => {
+    await stageAndCommit("purchase-final-receipt", [
+      { key: "price", action: "update_purchase_order_line", arguments: { line_item_id: report.ids.purchaseLine, changes: { purchase_price: "13.750000" } } },
+      { key: "receive", action: "receive_purchase_order", arguments: {
+      order_id: report.ids.purchaseOrder, items: [{ line_item_id: report.ids.purchaseLine, quantity: 2 }],
+    } }]);
+    const detail = (await tool("get_purchase_order", { order_id: report.ids.purchaseOrder, include_received_stock: true })).structuredContent.data;
+    assert.equal(detail.order.status, 30);
+    assert.equal(detail.receivedStock.count, 3);
+    assert.equal(detail.receivedStock.results.reduce((sum, item) => sum + item.quantity, 0), 500);
+    assert.deepEqual(detail.receivedStock.results.map((item) => Number(item.purchasePrice)).sort((a,b) => a-b), [0.125,0.125,0.1375]);
+    assert.ok(detail.lines.results.every((item) => item.outstanding === 0));
+    const current = await stage("purchase-complete-current", [{ key: "complete", action: "complete_purchase_order", arguments: { order_id: report.ids.purchaseOrder } }]);
+    assert.equal(current.structuredContent.data.status, "already_current");
+  });
+  let partialOrder, partialLine;
+  await check("PO validation rejects wrong suppliers, invalid transitions, excess receipts, and stale lines", async () => {
+    const [setup, done] = await stageAndCommit("purchase-partial-close-setup", [
+      { key: "manufacturerOnly", action: "create_company", arguments: { name: `${prefix} Manufacturer only`, is_manufacturer: true } },
+      { key: "otherSource", action: "create_supplier_part", arguments: { part_id: report.ids.part, supplier_id: report.ids.maker, SKU: `${prefix} Other supplier` } },
+      { key: "order", action: "create_purchase_order", arguments: { reference: `PO-${Date.now()}`, supplier_id: report.ids.supplier, destination_id: report.ids.location } },
+      { key: "line", action: "create_purchase_order_line", arguments: { order_id: ref("order", "purchase_order"), supplier_part_id: report.ids.purchaseSku, quantity: 2 } },
+      { key: "issue", action: "issue_purchase_order", arguments: { order_id: ref("order", "purchase_order") } },
+    ]);
+    report.ids.manufacturerOnly = resolved(setup, done, "manufacturerOnly", "company");
+    report.ids.otherSku = resolved(setup, done, "otherSource", "supplier_part");
+    partialOrder = resolved(setup, done, "order", "purchase_order"); partialLine = resolved(setup, done, "line", "purchase_order_line");
+    report.ids.partialPurchaseOrder = partialOrder; report.ids.partialPurchaseLine = partialLine;
+    for (const [label, action, arguments_, pattern] of [
+      ["wrong-role", "create_purchase_order", { reference: `PO-invalid-${Date.now()}`, supplier_id: report.ids.manufacturerOnly }, /active supplier/],
+      ["wrong-supplier", "create_purchase_order_line", { order_id: partialOrder, supplier_part_id: report.ids.otherSku, quantity: 1 }, /order's supplier/],
+      ["over-receipt", "receive_purchase_order", { order_id: partialOrder, items: [{ line_item_id: partialLine, quantity: 3 }] }, /remaining/],
+      ["wrong-line", "receive_purchase_order", { order_id: partialOrder, items: [{ line_item_id: report.ids.purchaseLine, quantity: 1 }] }, /does not belong/],
+      ["incomplete", "complete_purchase_order", { order_id: partialOrder }, /unreceived/],
+      ["terminal-edit", "update_purchase_order", { order_id: report.ids.purchaseOrder, changes: { description: "must not apply" } }, /terminal/],
+    ]) {
+      const rejected = await stage(`purchase-invalid-${label}`, [{ key: "invalid", action, arguments: arguments_ }], { allowError: true });
+      assert.equal(rejected.isError, true); assert.match(rejected.content[0].text, pattern);
+    }
+    const stale = await stage("purchase-stale-line", [
+      { key: "edit", action: "update_purchase_order", arguments: { order_id: partialOrder, changes: { supplier_reference: "must not apply" } } },
+      { key: "receive", action: "receive_purchase_order", arguments: { order_id: partialOrder, items: [{ line_item_id: partialLine, quantity: 1 }] } },
+    ]);
+    await api(`/api/order/po-line/${partialLine}/`, { method: "PATCH", body: { quantity: 3, order: partialOrder, part: report.ids.purchaseSku } });
+    const failed = await tool("commit_inventory_plan", { plan_id: stale.structuredContent.data.plan_id, expected_version: stale.structuredContent.data.plan_version }, { allowError: true });
+    assert.equal(failed.isError, true); assert.equal(failed.structuredContent.data.conflict_type, "stale_inventory");
+    assert.equal((await api(`/api/order/po/${partialOrder}/`)).supplier_reference, "");
+    assert.equal((await api(`/api/stock/?limit=100&purchase_order=${partialOrder}`)).count, 0);
+  });
+  await check("Explicit incomplete completion and draft cancellation preserve stock and receipt counts", async () => {
+    const closed = await stage("purchase-close-incomplete", [{ key: "complete", action: "complete_purchase_order", arguments: { order_id: partialOrder, accept_incomplete: true } }]);
+    await commit(closed);
+    assert.equal((await api(`/api/order/po/${partialOrder}/`)).status, 30);
+    assert.equal(Number((await api(`/api/order/po-line/${partialLine}/`)).received), 0);
+    assert.equal((await api(`/api/stock/?limit=100&purchase_order=${partialOrder}`)).count, 0);
+    const cancelled = await stage("purchase-cancel-draft", [
+      { key: "order", action: "create_purchase_order", arguments: { reference: `PO-${Date.now()}`, supplier_id: report.ids.supplier } },
+      { key: "cancel", action: "cancel_purchase_order", arguments: { order_id: ref("order", "purchase_order") } },
+    ]);
+    const done = await commit(cancelled);
+    const id = resolved(cancelled, done, "order", "purchase_order"); report.ids.cancelledPurchaseOrder = id;
+    assert.equal((await api(`/api/order/po/${id}/`)).status, 40);
+  });
+  await check("Fractional supplier-pack deliveries reconcile without false excess rejection", async () => {
+    const [staged, done] = await stageAndCommit("purchase-fractional-first", [
+      { key: "order", action: "create_purchase_order", arguments: { reference: `PO-${Date.now()}`, supplier_id: report.ids.supplier, destination_id: report.ids.location } },
+      { key: "line", action: "create_purchase_order_line", arguments: { order_id: ref("order", "purchase_order"), supplier_part_id: report.ids.purchaseSku, quantity: 0.3 } },
+      { key: "issue", action: "issue_purchase_order", arguments: { order_id: ref("order", "purchase_order") } },
+      { key: "receive", action: "receive_purchase_order", arguments: { order_id: ref("order", "purchase_order"), items: [{ line_item_id: ref("line", "purchase_order_line"), quantity: 0.1 }] } },
+    ]);
+    const orderId = resolved(staged, done, "order", "purchase_order");
+    const lineId = resolved(staged, done, "line", "purchase_order_line");
+    report.ids.fractionalPurchaseOrder = orderId;
+    await stageAndCommit("purchase-fractional-last", [{ key: "receive", action: "receive_purchase_order", arguments: { order_id: orderId, items: [{ line_item_id: lineId, quantity: 0.2 }] } }]);
+    const detail = (await tool("get_purchase_order", { order_id: orderId, include_received_stock: true })).structuredContent.data;
+    assert.equal(detail.order.status, 30); assert.equal(detail.lines.results[0].received, 0.3);
+    assert.equal(detail.receivedStock.results.reduce((sum, item) => sum + item.quantity, 0), 30);
+  });
+  await check("Serialized PO receipt creates two individual sourced stock items", async () => {
+    const staged = await stage("purchase-serialized", [
+      { key: "part", action: "create_part_with_stock", arguments: { part: { name: `${prefix} Serialized component`, category_id: report.ids.category, trackable: true } } },
+      { key: "source", action: "create_supplier_part", arguments: { part_id: ref("part", "part"), supplier_id: report.ids.supplier, SKU: `${prefix} Serialized SKU` } },
+      { key: "order", action: "create_purchase_order", arguments: { reference: `PO-${Date.now()}`, supplier_id: report.ids.supplier, destination_id: report.ids.location } },
+      { key: "line", action: "create_purchase_order_line", arguments: { order_id: ref("order", "purchase_order"), supplier_part_id: ref("source", "supplier_part"), quantity: 2 } },
+      { key: "issue", action: "issue_purchase_order", arguments: { order_id: ref("order", "purchase_order") } },
+      { key: "receive", action: "receive_purchase_order", arguments: { order_id: ref("order", "purchase_order"), items: [
+        { line_item_id: ref("line", "purchase_order_line"), quantity: 2, serial_numbers: "70001,70002", status: "quarantined" },
+      ] } },
+    ]);
+    const done = await commit(staged);
+    const orderId = resolved(staged, done, "order", "purchase_order");
+    report.ids.serializedPurchaseOrder = orderId;
+    const detail = (await tool("get_purchase_order", { order_id: orderId, include_received_stock: true })).structuredContent.data;
+    assert.equal(detail.order.status, 30); assert.equal(detail.receivedStock.count, 2);
+    assert.deepEqual(detail.receivedStock.results.map((item) => item.serial).sort(), ["70001", "70002"]);
+    assert.ok(detail.receivedStock.results.every((item) => item.quantity === 1 && item.status === "Quarantined"));
+    assert.ok(detail.receivedStock.results.every((item) => item.supplierPartId === resolved(staged, done, "source", "supplier_part")));
   });
   await check("Build order lookup reads real BOM component requirements", async () => {
     const assembly = await stage("assembly", [{ key: "assembly", action: "create_part_with_stock", arguments: {

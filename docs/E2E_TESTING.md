@@ -26,7 +26,7 @@ On first setup, `E2E_INVENTREE_PORT` and `E2E_MCP_PORT` can override the host po
 
 The test client sends HTTP JSON-RPC directly to the built MCP container, authenticating through discovery, dynamic client registration, authorization-code PKCE, and the real upstream API token. The core fixture is canonical part `10nF 50V X7R 0603`, linked to manufacturer part `0603B103K500NT`, supplier SKU `C57112`, four parameter values, and supplier-linked stock.
 
-The 24 checks cover:
+The 30 checks cover:
 
 - Real server version and token authentication; OAuth discovery, PKCE, read-only scope enforcement, initialization, tool discovery, and refresh rotation.
 - Skill discovery/import manifests, every packaged resource's exact bytes and SHA-256 digest, and read-only guide fallback through the built Docker image.
@@ -39,9 +39,15 @@ The 24 checks cover:
 - Image upload through a capability URL, staged multipart commit, and authenticated thumbnail retrieval through the media proxy.
 - Migrating existing part `RC0603FR-0710KL` to `10kΩ ±1% 0603 75V 100mW`, adding linked sourcing and five parameters, and attaching the supplier part to two original stock lots while verifying all their other fields and IDs remain intact.
 - Sparse stock edits, clearing/restoring provenance, already-current part/stock edits, cross-part source rejection, stale migration rejection before renaming, and editing initial-stock/receipt outputs within the same plan.
-- Purchase-order lines with distinct supplier-part and canonical-part IDs, and build-order requirements generated from a real BOM.
+- Purchase-order creation and sparse order/line edits, separate same-source lines without hidden merging, hold/issue transitions, partial and final receipts, supplier-pack conversion (5 packs of 100 become 500 canonical units), per-unit pricing, linked stock pagination, and idempotent receipt replay.
+- Wrong supplier/line validation, excess-receipt rejection, stale-line rejection before any write, explicit incomplete completion without stock creation, and draft cancellation.
+- A serialized purchase receipt producing two individual supplier-linked stock items with quarantined status, including the compatibility correction for InvenTree 1.5.6.
+- Fractional pack deliveries (0.1 then 0.2 against 0.3 ordered) without false excess-receipt rejection.
+- Build-order requirements generated from a real BOM.
 
-Category defaults, purchase orders, purchase lines, and the BOM/build fixtures are seeded directly through the test InvenTree API. Order tools are tested as reads; order lifecycle writes remain unsupported. All connector mutations otherwise go through MCP plans and commits, with direct API reads checking the stored results.
+Category defaults and the BOM/build fixtures are seeded directly through the test InvenTree API. A purchase-line edit is also made directly to simulate a concurrent change. Purchase orders, lines, transitions, and receipts otherwise go through MCP plans and commits, with direct API reads checking stored results. Build-order tools remain reads.
+
+Completing purchase orders can schedule asynchronous part-pricing updates. Later purchase checks may restage after a preflight `stale_inventory` rejection, which occurs before any writes. These bounded restages are recorded in the report. Other failures, including partially applied commits, are never retried as fresh workflows.
 
 ## Verified version and compatibility fix
 
@@ -52,5 +58,9 @@ inventree/inventree@sha256:b61e6a7534bf82e70b72d8de53d0983ecda1343554e090baf7024
 ```
 
 Real-server testing found that scoped parameter templates serialize their model type as `part.part`. The connector now accepts that form as well as `part`, while continuing to reject templates scoped to other models. The fast regression fixture also uses the real serialized form.
+
+Purchase-order testing also found that sparse line PATCH requests require the line's unchanged `order` and SupplierPart `part` IDs. The connector sends those validated identities alongside the changed fields; the public update action keeps both identities immutable.
+
+InvenTree 1.5.6 also drops a non-OK status when receiving serialized stock. The connector stages a conditional status correction against the stock returned by the receipt. A correction failure records the completed receipt and its stock IDs in `review_inventory_plan`, enabling recovery without creating stock again. Regression tests cover that partial failure and prevent receipt replay.
 
 The stack intentionally remains running after checks. `test:e2e:down` preserves volumes so it can be restarted and inspected; deleting volumes is a separate explicit action.
