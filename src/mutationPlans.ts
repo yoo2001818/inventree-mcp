@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { randomToken } from "./crypto.js";
 import { DomainError, versionConflict } from "./domainErrors.js";
+import { numberValue, pageResults, record } from "./inventoryDomain.js";
 import { InvenTreeClient, InvenTreeError } from "./inventree.js";
 import type { PartImageUploads } from "./partImages.js";
 import type { OAuthService } from "./oauth.js";
@@ -72,7 +73,8 @@ function opaqueId(prefix: string): string {
 }
 
 function outputPrefix(entityType: InventoryEntityType): string {
-  return { part: "part", stock_item: "stock", part_category: "category", stock_location: "location" }[entityType];
+  return { part: "part", stock_item: "stock", part_category: "category", stock_location: "location",
+    company: "company", manufacturer_part: "manufacturer", supplier_part: "supplier", parameter_template: "template" }[entityType];
 }
 
 export function stagePlan(
@@ -238,6 +240,22 @@ function resolveOutput(output: MutationOutput, result: unknown): number | string
   throw new Error(`Step output ${output.ref} did not return an identifier at an expected path`);
 }
 
+async function writeParameterUpsert(client: InvenTreeClient, path: string, value: unknown): Promise<unknown> {
+  const body = record(value);
+  if (path !== "/api/parameter/" || body.model_type !== "part" || !numberValue(body.model_id) || !numberValue(body.template)) {
+    throw new Error("Invalid deferred part parameter setter");
+  }
+  const source = await client.get(path, { model_type: body.model_type, model_id: body.model_id,
+    template: body.template, limit: 2, offset: 0 });
+  const matches = pageResults(source);
+  if (matches.length > 1 || numberValue(record(source).count) > 1) throw new Error("Multiple inherited values exist for a part parameter");
+  const previous = matches[0];
+  return previous
+    ? client.write("PATCH", `${path}${numberValue(previous.pk)}/`, { data: body.data,
+      ...(body.note !== undefined ? { note: body.note } : {}) })
+    : client.write("POST", path, body);
+}
+
 function requireOwnedPlan(oauth: OAuthService, authInfo: AuthInfo, planId: string): MutationPlan {
   oauth.store.cleanup();
   const plan = oauth.store.snapshot.mutationPlans[planId];
@@ -335,7 +353,9 @@ export async function commitPlan(
               filename: upload.filename,
               mimeType: upload.mimeType,
             })
-          : await client.write(request.method, requestPath, body);
+          : request.parameterUpsert
+            ? await writeParameterUpsert(client, requestPath, body)
+            : await client.write(request.method, requestPath, body);
         completedRequests += 1;
         if (upload) {
           const responseRecord = response !== null && typeof response === "object"

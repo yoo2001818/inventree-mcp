@@ -30,6 +30,7 @@ import type { OAuthService } from "./oauth.js";
 import { InvenTreeError } from "./inventree.js";
 import { inspectImage, type PartImageUploads } from "./partImages.js";
 import { clientFor, READ_SECURITY, result, safely } from "./mcpSupport.js";
+import { partParameters, requiredCatalogRecord } from "./catalogReadTools.js";
 
 const cursorSchema = z.string().optional().describe("Opaque cursor returned by a previous call");
 const limitSchema = z.number().int().min(1).max(100).default(20);
@@ -300,9 +301,12 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
     {
       title: "Find parts and their stock",
       description:
-        "Find parts by name, description, IPN, keywords, category, manufacturer, supplier SKU, or tags. Returns compact quantities and physical locations in the same call.",
+        "Find canonical parts by name, description, IPN, keywords, category, MPN, supplier SKU, tags, or structured parameter filters. Returns compact quantities and physical locations in the same call.",
       inputSchema: {
-        query: z.string().min(1),
+        query: z.string().min(1).optional().describe("Name, description, IPN, MPN, or supplier SKU; omit when searching by category or parameters"),
+        parameters: z.array(z.object({ template_id: z.number().int().positive(),
+          value: z.string().min(1).max(500), operator: z.enum(["eq", "ne", "gt", "gte", "lt", "lte", "icontains"]).default("eq") }).strict())
+          .max(30).default([]).describe("ANDed specification filters. Resolve template IDs with list_parameter_templates. Values can include units, e.g. 10nF or 50V."),
         category_id: z.number().int().positive().optional(),
         include_subcategories: z.boolean().default(true),
         stock: z.enum(["any", "in_stock", "depleted", "below_minimum"]).default("any"),
@@ -317,7 +321,15 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
       safely(oauth, async () => {
         const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
         const offset = decodeCursor(input.cursor);
-        const normalizedQuery = normalizePartSearchQuery(input.query);
+        if (!input.query && !input.category_id && !input.parameters.length) throw new Error("Provide a query, category_id, or parameter filters");
+        const normalizedQuery = input.query ? normalizePartSearchQuery(input.query) : undefined;
+        const parameterFilters: Record<string, unknown> = {};
+        for (const filter of input.parameters) {
+          const key = `parameter_${filter.template_id}${filter.operator === "eq" ? "" : `_${filter.operator}`}`;
+          if (Object.hasOwn(parameterFilters, key)) throw new Error(`Duplicate parameter filter: ${key}`);
+          await requiredCatalogRecord(client, "/api/parameter/template/", "parameter_template", filter.template_id, "list_parameter_templates");
+          parameterFilters[key] = filter.value;
+        }
         const data = await client.get("/api/part/", {
           search: normalizedQuery,
           category: input.category_id,
@@ -331,6 +343,7 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
           limit: input.limit,
           offset,
           ordering: "name",
+          ...parameterFilters,
         });
         const parts = pageResults(data);
         const summaries = await Promise.all(
@@ -360,16 +373,18 @@ export function registerReadTools(server: McpServer, oauth: OAuthService, imageU
     async (input, extra) =>
       safely(oauth, async () => {
         const { client } = clientFor(oauth, extra.authInfo, "inventree.read");
-        const part = record(await requiredPart(client, input.part_id, input.include.includes("parameters")));
+        const part = record(await requiredPart(client, input.part_id));
         const stock = await stockForPart(client, input.part_id, input.include_depleted);
         const summary = normalizePart(part, stock);
+        const parameters = input.include.includes("parameters") ? await partParameters(client, input.part_id, 100) : undefined;
         return result(
-          summary,
+          { ...summary, ...(parameters ? { parameters } : {}) },
           formatPartInventory(
             summary,
             input.include.includes("notes") ? optionalString(part.notes) : undefined,
-            input.include.includes("parameters") ? records(part.parameters) : undefined,
-          ),
+            parameters?.results.map((parameter) => ({ template: parameter.templateId,
+              template_detail: { name: parameter.name }, data: parameter.value + (parameter.units ? ` [${parameter.units}]` : "") })),
+          ) + (parameters?.nextCursor ? `\nMore parameters: use get_part_parameters with cursor ${parameters.nextCursor}.` : ""),
         );
       }),
   );

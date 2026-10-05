@@ -1,0 +1,4 @@
+interface:
+  display_name: "InvenTree Inventory"
+  short_description: "Manage parts, sourcing, parameters, and stock"
+  default_prompt: "Use $inventree-inventory to organize my parts and stock with the connected InvenTree MCP server."

@@ -21,6 +21,7 @@ import {
 const PLAN_ACTION_GUIDE = [
   "Step shape: {key, action, arguments}. Action argument guide:",
   "create_part_with_stock {part:{name,category_id,...}, initial_stock?}; update_part {part_id,changes};",
+  "update_stock {stock_item_id,changes:{supplier_part_id?,batch?,packaging?,expiry_date?,notes?,link?}}; supplier_part_id:null clears stock provenance; preserve stock IDs and quantity when migrating existing parts.",
   "set_part_image {part_id,upload_ref}; receive_stock {part_id,quantity,location_id,...};",
   "consume_stock {part_id,quantity,location_id?,stock_item_id?,strategy?,reason?,notes?};",
   "move_stock {destination_location_id plus stock_item_id, part_id/source_location_id, or source_location_id/all};",
@@ -28,9 +29,15 @@ const PLAN_ACTION_GUIDE = [
   "set_stock_status {stock_item_ids,status,notes?}; create_part_category {name,parent_id?,...};",
   "update_part_category {category_id,changes}; create_stock_location {name,parent_id?,...};",
   "update_stock_location {location_id,changes}; print_labels {entity_type,entities,template,printer?,copies?}.",
+  "create_company {name,is_supplier?,is_manufacturer?,...}; update_company {company_id,changes};",
+  "create_manufacturer_part {part_id,manufacturer_id,MPN,...}; update_manufacturer_part {manufacturer_part_id,changes};",
+  "create_supplier_part {part_id,supplier_id,SKU,manufacturer_part_id?,...}; update_supplier_part {supplier_part_id,changes};",
+  "create_parameter_template {name,units?,choices?,...}; update_parameter_template {parameter_template_id,changes};",
+  "set_part_parameters {part_id,parameters:[{template_id,data,note?}]}; receive_stock optionally accepts supplier_part_id.",
   "Exact outputs (never append _id): create_part_with_stock -> part, plus stock_item only with initial_stock;",
   "receive_stock -> stock_item only when it creates a new item (use merge:new_item when a later step requires it);",
-  "create_part_category -> part_category; create_stock_location -> stock_location; all other actions -> no outputs.",
+  "create_part_category -> part_category; create_stock_location -> stock_location; create_company -> company;",
+  "create_manufacturer_part -> manufacturer_part; create_supplier_part -> supplier_part; create_parameter_template -> parameter_template; all other actions -> no outputs.",
   "Reference example: {step:\"part\",output:\"stock_item\"}, where step is the exact earlier step key.",
 ].join(" ");
 

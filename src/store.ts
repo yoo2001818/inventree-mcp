@@ -51,6 +51,8 @@ export interface MutationRequest {
   method: "POST" | "PATCH" | "PUT";
   path: string | MutationPathSegment[];
   body: unknown;
+  // Newly created parts can inherit category parameters before setters run.
+  parameterUpsert?: true;
   imageUpload?: {
     uploadRef: string;
     field: "image";
@@ -65,7 +67,8 @@ export interface MutationCheck {
   digest: string;
 }
 
-export type InventoryEntityType = "part" | "stock_item" | "part_category" | "stock_location";
+export type InventoryEntityType = "part" | "stock_item" | "part_category" | "stock_location"
+  | "company" | "manufacturer_part" | "supplier_part" | "parameter_template";
 
 export interface MutationOutput {
   ref: string;

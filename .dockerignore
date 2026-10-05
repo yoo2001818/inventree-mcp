@@ -4,3 +4,4 @@ dist
 .env
 data
 *.log
+.e2e/

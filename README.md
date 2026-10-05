@@ -19,16 +19,25 @@ The service is intentionally self-contained for a single owner:
 
 ## MCP tools
 
-The default workflow profile is intentionally limited to household parts and physical stock. It does not expose manufacturing, purchasing, sales, or BOM workflows.
+The connector supports canonical parts, physical stock, sourcing companies, manufacturer parts, supplier parts, and part parameters. Purchase and build orders have compact read-only lookup and detail tools; order creation, purchasing receipts, BOM editing, and build allocation/completion are future workflows.
 
 Read tools return compact Markdown plus minimal normalized structured data. Category and location results preserve their hierarchy, and part search includes quantities, physical paths, and exact stock-item IDs in one call.
 
 | Read tool | Purpose |
 | --- | --- |
+| `get_inventory_guide` | Load the packaged skill or detailed workflow recipes |
 | `browse_part_categories` | Browse or search the category hierarchy |
 | `browse_stock_locations` | Browse or search the physical-location hierarchy |
 | `find_parts` | Find parts with aggregate quantities and stock placements |
-| `get_part_inventory` | Fetch one useful part card and every stock placement |
+| `get_part_inventory` | Fetch a part card and stock placements, optionally including parameter values |
+| `list_companies` | Find suppliers and manufacturers, including companies with both roles |
+| `find_manufacturer_parts` | Resolve MPNs to manufacturer-part and canonical-part IDs |
+| `find_supplier_parts` | Resolve supplier SKUs to supplier-part, MPN, and canonical-part IDs |
+| `get_part_sourcing` | Show a canonical part’s manufacturer and supplier records |
+| `list_parameter_templates` | Resolve specification templates, units, and allowed choices |
+| `get_part_parameters` | Read canonical specifications with template IDs and values |
+| `list_purchase_orders` / `get_purchase_order` | Find purchase orders and inspect their supplier-part lines and receipts |
+| `list_build_orders` / `get_build_order` | Find builds and inspect required components, allocations, and consumption |
 | `get_part_image` | Return thumbnails/previews inline or an expiring URL for the original image |
 | `inventory_at_location` | List what is physically stored at a location or subtree |
 | `check_stock_levels` | Find depleted or below-minimum parts |
@@ -48,13 +57,25 @@ Read tools return compact Markdown plus minimal normalized structured data. Cate
 | `commit_inventory_plan` | Revalidate and commit the once-confirmed plan |
 | `inventree_write` | Optional advanced raw POST/PATCH/PUT escape hatch; no DELETE |
 
-The typed actions inside `create_inventory_plan` are `create_part_with_stock`, `update_part`, `set_part_image`, `receive_stock`, `consume_stock`, `move_stock`, `count_stock`, `set_stock_status`, `create_part_category`, `update_part_category`, `create_stock_location`, `update_stock_location`, and `print_labels`. These action names are not separately callable MCP tools.
+The typed actions inside `create_inventory_plan` are `create_part_with_stock`, `update_part`, `update_stock`, `set_part_image`, `receive_stock`, `consume_stock`, `move_stock`, `count_stock`, `set_stock_status`, `create_part_category`, `update_part_category`, `create_stock_location`, `update_stock_location`, `print_labels`, `create_company`, `update_company`, `create_manufacturer_part`, `update_manufacturer_part`, `create_supplier_part`, `update_supplier_part`, `create_parameter_template`, `update_parameter_template`, and `set_part_parameters`. These action names are not separately callable MCP tools.
+
+Keep the canonical name readable, for example **10nF 50V X7R 0603**. Put `0603B103K500NT` on a manufacturer part and `C57112` on an LCSC supplier part; store capacitance, voltage, dielectric, and package as parameters. `find_parts` accepts structured parameter filters as well as MPN/SKU text search. `receive_stock` accepts `supplier_part_id` to retain provenance and prevents merging stock from different sources. See [the sourcing and specifications workflow](docs/SOURCING_AND_PARAMETERS.md) for action contracts, an ordered-plan example, and the order roadmap.
 
 The raw write escape hatch is disabled by default. Set `ENABLE_RAW_WRITE=true` only for development or unusual upstream features; routine clients should use dedicated workflow tools. Use a dedicated InvenTree user with the narrowest roles you can tolerate; the upstream server remains the final authorization boundary.
 
 Part-image bytes never enter MCP JSON arguments or the persisted plan store. Call `prepare_part_image_upload` to receive an expiring, credential-scoped `upload_ref` and capability URL. A person can open that URL and choose a file, while a native client can `PUT` raw PNG, JPEG, GIF, or extended WebP bytes to the same URL without an OAuth header. The capability token is unguessable, short-lived, and omitted from HTTP access logs. After upload, pass the already-known reference to a `set_part_image` action inside `create_inventory_plan`, review the returned complete plan, and commit once. For reads, `get_part_image` returns thumbnails and previews immediately as base64 MCP image content; only `variant: "original"` returns a short-lived direct-download URL and MCP resource link. `IMAGE_UPLOAD_MAX_BYTES` and `IMAGE_MAX_PIXELS` configure the in-memory bounds.
 
 The full command rationale, output contracts, and workflow examples are in [`docs/AI_ERGONOMIC_MCP_COMMANDS.md`](docs/AI_ERGONOMIC_MCP_COMMANDS.md).
+
+## AI workflow skill
+
+The project includes a portable [InvenTree inventory skill](skills/inventree-inventory/SKILL.md) with [detailed recipes](skills/inventree-inventory/references/workflows.md). It teaches canonical naming, MPN/SKU relationships, parameter discovery, existing-part migrations, stock provenance, plan review/commit, and recovery from stale or partially applied plans. Order lifecycle writes remain unsupported.
+
+For a local Codex workspace, copy the entire `skills/inventree-inventory` folder into that workspace's `.agents/skills/inventree-inventory`, then invoke `$inventree-inventory`. Configure the InvenTree MCP connection separately. You can also explicitly ask an agent working in this repository to read `skills/inventree-inventory/SKILL.md`.
+
+The MCP serves the same package through the `io.modelcontextprotocol/skills` extension: `skills/list` and `skills/get` return its frontmatter and SHA-256 resource manifest; `resources/read` supplies each file at its `skill://inventree-mcp/inventree-inventory/...` URI. These reads require `inventree.read`. Docker images include the package, and the server caches its bytes and digests together at startup; restart after changing a skill file.
+
+[OpenAI plugin import](https://developers.openai.com/plugins/build/mcp-server#import-skills-from-the-mcp-server) supports a bounded subset of this draft extension. Plugin setup imports a snapshot rather than fetching skills during conversations; rescan the MCP server after updating the package. Other clients may not support skill import. For those clients, call `get_inventory_guide {section:"overview"}` and, when needed, `{section:"workflows"}` to retrieve the same guidance through an ordinary read-only tool. Server initialization instructions also point agents to this guide.
 
 ## Deploy with Docker Compose
 
@@ -124,7 +145,13 @@ npm test
 npm run build
 ```
 
-The end-to-end test starts a fake InvenTree server and exercises DCR, authorization, upstream token validation, PKCE exchange, MCP initialization, tool discovery, a real proxied part search, insufficient-scope reauthorization, and refresh-token rotation.
+`npm test` uses a fake InvenTree backend for fast regression coverage. To test the built MCP container against an isolated real InvenTree database, run:
+
+```bash
+npm run test:e2e
+```
+
+This starts a dedicated Docker project with InvenTree, PostgreSQL, Redis, a worker, a media proxy, and MCP. It leaves the services running at <http://localhost:18000> and <http://localhost:18300/mcp>. Tests include migrating an existing MPN-named resistor and attaching supplier provenance to its original stock lots. Generated credentials, logs, and the latest test report are in the Git-ignored `.e2e/` directory. Run `npm run test:e2e:run` to repeat checks against the running stack, or `npm run test:e2e:down` to stop it while preserving its test volumes. See [the real-server test guide](docs/E2E_TESTING.md) for coverage and configuration.
 
 ## Security notes
 

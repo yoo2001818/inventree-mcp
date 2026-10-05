@@ -13,6 +13,7 @@ import type { PlannedOutputInput } from "../mutationPlans.js";
 import type { OAuthService } from "../oauth.js";
 import { clientFor, result, safely, WRITE_SECURITY } from "../mcpSupport.js";
 import type { MutationCheck, MutationOutput, MutationRequest } from "../store.js";
+import { CatalogContext, sameEntity } from "./catalogPrimitives.js";
 import {
   STATUS_CODES,
   MutationPrimitiveRegistry,
@@ -51,6 +52,7 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
         part_id: entityIdSchema(),
         quantity: positiveQuantity,
         location_id: entityIdSchema(),
+        supplier_part_id: entityIdSchema().optional().describe("Source supplier part, linked to the same canonical part. Keeps sourcing provenance on new stock and prevents merging different sources."),
         merge: z.enum(["compatible", "new_item", "stock_item"]).default("compatible"),
         stock_item_id: entityIdSchema().optional(),
         batch: z.string().max(100).nullable().optional(),
@@ -69,6 +71,12 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
         const partId = normalizeEntityId(input.part_id);
         const locationId = normalizeEntityId(input.location_id);
+        const sourcing = new CatalogContext(oauth, auth, client, input.plan_id);
+        const supplier = input.supplier_part_id === undefined ? undefined : await sourcing.entity("supplier_part", input.supplier_part_id);
+        if (supplier && !sameEntity(supplier.data.part, mutationValue(partId))) {
+          throw new Error("The source supplier part must refer to the received canonical part");
+        }
+        if (supplier?.data.active === false) throw new Error("The source supplier part is inactive");
         const partOutput = plannedOutput(oauth, auth, input.plan_id, partId, "part");
         const locationOutput = plannedOutput(oauth, auth, input.plan_id, locationId, "stock_location");
         const [part, location] = await Promise.all([
@@ -107,11 +115,16 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
           if (target && (numberValue(target.status, 10) !== 10 || target.expired === true)) {
             throw new Error("New stock cannot be merged into a non-OK or expired stock item");
           }
+          if ((target || targetOutput) && !sameEntity(target ? target.supplier_part || null : targetOutput?.metadata?.supplier_part ?? null,
+            supplier ? mutationValue(supplier.id) : null)) {
+            throw new Error("The selected stock item has different supplier provenance; use merge=new_item");
+          }
         } else if (input.merge === "compatible") {
           const compatible = pageResults(listed).filter(
             (item) =>
               numberValue(item.status, 10) === 10 &&
               item.expired !== true &&
+              sameEntity(item.supplier_part || null, supplier ? mutationValue(supplier.id) : null) &&
               (optionalString(item.batch) ?? null) === (input.batch || null) &&
               (optionalString(item.packaging) ?? null) === (input.packaging || null) &&
               (optionalString(item.expiry_date) ?? null) === (input.expiry_date || null),
@@ -143,6 +156,7 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
                   part: mutationValue(partId),
                   quantity: input.quantity,
                   location: mutationValue(locationId),
+                  ...(supplier ? { supplier_part: mutationValue(supplier.id) } : {}),
                   ...(input.batch ? { batch: input.batch } : {}),
                   ...(input.packaging ? { packaging: input.packaging } : {}),
                   ...(input.expiry_date ? { expiry_date: input.expiry_date } : {}),
@@ -162,6 +176,7 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
             : `Receive ${formatQuantity(input.quantity, units)} of ${partDisplay}\n- Create a new stock item in ${locationDisplay}`;
         const detailedSummary = [
           summary,
+          ...(supplier ? [`- Supplier part: ${supplier.display} (${typeof supplier.id === "number" ? `#${supplier.id}` : `ref ${supplier.id}`})`] : []),
           ...(input.batch ? [`- Batch: ${input.batch}`] : []),
           ...(input.packaging ? [`- Packaging: ${input.packaging}`] : []),
           ...(input.expiry_date ? [`- Expiry: ${input.expiry_date}`] : []),
@@ -180,9 +195,10 @@ export function registerStockPrimitives(primitives: MutationPrimitiveRegistry, o
               requestIndex: 0,
               responsePaths: [[0, "pk"], ["pk"]],
               display: `${partDisplay} in ${locationDisplay}`,
-              metadata: { part_name: partDisplay, location: locationDisplay, quantity: input.quantity },
+              metadata: { part: mutationValue(partId), part_name: partDisplay, location: locationDisplay, quantity: input.quantity,
+                supplier_part: supplier ? mutationValue(supplier.id) : null },
             }];
-        return stageMutation(oauth, auth, input, detailedSummary, requests, await checksFor(client, checkPaths), outputs);
+        return stageMutation(oauth, auth, input, detailedSummary, requests, [...sourcing.checks, ...await checksFor(client, checkPaths)], outputs);
       }),
   );
 

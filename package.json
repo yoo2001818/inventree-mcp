@@ -13,6 +13,9 @@
     "dev:watch": "tsx watch --env-file=.env src/index.ts",
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/**/*.test.ts",
+    "test:e2e": "node scripts/e2e/stack.mjs",
+    "test:e2e:run": "node scripts/e2e/stack.mjs run",
+    "test:e2e:down": "node scripts/e2e/stack.mjs down",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -21,6 +24,7 @@
     "express": "^5.1.0",
     "helmet": "^8.1.0",
     "morgan": "^1.11.0",
+    "yaml": "^2.9.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {

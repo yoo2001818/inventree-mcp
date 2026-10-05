@@ -5,16 +5,22 @@ import type { PartImageUploads } from "./partImages.js";
 import { clientFor, READ_SECURITY, result, safely, WRITE_SECURITY } from "./mcpSupport.js";
 import { registerReadTools } from "./readTools.js";
 import { registerWriteTools } from "./writeTools.js";
+import { registerCatalogReadTools } from "./catalogReadTools.js";
+import { registerOrderReadTools } from "./orderReadTools.js";
+import { registerSkills } from "./skills.js";
 
 export function createMcpServer(oauth: OAuthService, imageUploads: PartImageUploads): McpServer {
   const server = new McpServer(
     { name: "inventree-mcp", version: "0.3.0" },
     {
-      instructions: "Home parts and physical stock only.",
+      instructions: "Before complex inventory changes, load get_inventory_guide (overview, then workflows as needed), or the inventree-inventory skill via skills/list and resources/read. Use readable canonical Part names, ManufacturerParts for MPNs, SupplierParts for SKUs, and parameters for specifications. Preserve existing Part and StockItem IDs during migration. Stage typed inventory plans, review the concrete changes, commit authorized plans, then verify. Purchase/build order tools are read-only.",
     },
   );
 
   registerReadTools(server, oauth, imageUploads);
+  registerSkills(server, oauth);
+  registerCatalogReadTools(server, oauth);
+  registerOrderReadTools(server, oauth);
   registerWriteTools(server, oauth, imageUploads);
 
   server.registerTool(

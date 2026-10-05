@@ -15,6 +15,7 @@ export interface EntityRef {
 
 export interface StockPlacement {
   stockItemId: number;
+  supplierPartId?: number;
   location: EntityRef | null;
   quantity: number;
   units?: string;
@@ -176,6 +177,7 @@ export function normalizeStock(stock: unknown, fallbackUnits?: string): StockPla
   const part = record(item.part_detail);
   return {
     stockItemId: numberValue(item.pk),
+    ...(numberValue(item.supplier_part) ? { supplierPartId: numberValue(item.supplier_part) } : {}),
     location: locationRef(item) ?? null,
     quantity: numberValue(item.quantity),
     ...(optionalString(part.units) || fallbackUnits
@@ -224,6 +226,7 @@ export function normalizePart(partValue: unknown, stockValues: unknown[] = []): 
 
 function differentiators(placement: StockPlacement): string {
   const details = [
+    placement.supplierPartId ? `supplier part #${placement.supplierPartId}` : "",
     placement.batch ? `batch ${placement.batch}` : "",
     placement.serial ? `serial ${placement.serial}` : "",
     placement.packaging ? placement.packaging : "",

@@ -1,4 +1,4 @@
-# AI-Ergonomic MCP Commands for Home Parts Inventory
+# AI-Ergonomic MCP Commands for Parts Inventory
 
 ## Purpose
 
@@ -11,7 +11,7 @@ This document defines the MCP tool surface for using InvenTree as a personal par
 - "Create a category for JST connectors."
 - "Print labels for the new bins."
 
-Manufacturing, BOM, purchasing, suppliers, sales, customers, and order allocation are deliberately out of scope. InvenTree may still expose those features through its API, but they should not occupy the model's tool-selection context or leak into routine results.
+Canonical parts, physical stock, sourcing companies, manufacturer parts, supplier parts, and part parameters are supported. Purchase and build orders support read-only lookup and detail inspection. Sales, customers, BOM editing, purchasing receipts, and build allocation/completion remain future workflows. The current sourcing contracts and examples are in [SOURCING_AND_PARAMETERS.md](SOURCING_AND_PARAMETERS.md).
 
 The source material is:
 
@@ -340,7 +340,7 @@ Suggested intent:
 }
 ```
 
-The public tool schema should not expose assembly, build, purchasing, sales, supplier, pricing, or revision fields. Server-side defaults should set irrelevant feature flags consistently. Before preparing the write, the server should run a duplicate search using name, IPN, and keywords and return candidates if found.
+Part creation and updates expose `assembly`, `component`, and `purchaseable` when needed; defaults remain `false`, `true`, and `true` respectively. Supplier and manufacturer identifiers belong on separate linked records. Sales, pricing, and revision workflows remain outside this profile. Before preparing the write, the server should run a duplicate search using name, IPN, and keywords and return candidates if found.
 
 `units` is optional and should normally be omitted for ordinary individually counted household items. It is not a free-form display label: when explicitly needed, it must be a formal measurement or counting unit configured in InvenTree, such as `m`, `kg`, `L`, `piece`, `each`, `dozen`, `hundred`, or `thousand`. Never send localized counting words, arbitrary item nouns, or packaging descriptions as units. If supplied, the connector validates the exact value against `/api/units/all/` before creating a plan; invalid units therefore cannot cause a partially committed create workflow.
 
@@ -360,6 +360,14 @@ Suggested editable fields:
 - active, trackable, locked
 
 Omitted fields mean "unchanged"; `null` means "clear" where the upstream field allows it. The preview must show a field-level before/after diff.
+
+### Action: `update_stock`
+
+Purpose: edit metadata on an existing stock item, including attaching a newly staged supplier part during migration of an MPN-named canonical part.
+
+Inputs: `stock_item_id` plus sparse `changes` containing `supplier_part_id`, `batch`, `packaging`, `expiry_date`, `notes`, or `link`. Supplier provenance may be an earlier `supplier_part` plan output or `null` to clear it. A supplier part must belong to the stock item's canonical part. Preview exact before/after differences and retain the existing stock ID, quantity, and location. Use separate count, movement, and status actions for those operations.
+
+Part and stock metadata edits account for earlier edits in the same plan, skip already-current values, and reject stale inventory before commit. See [the existing-part migration example](SOURCING_AND_PARAMETERS.md#migrate-an-existing-part-and-stock).
 
 ### Action: `receive_stock`
 
@@ -815,7 +823,7 @@ After these are proven, disable `inventree_write` by default. Keep it behind an 
 
 - Remove `get_part_bom` from the default home-inventory profile.
 - Keep `inventree_get` as an advanced read-only escape hatch with a clearly documented raw result.
-- Do not add manufacturing, purchasing, or sales tools to this profile.
+- Keep order lifecycle mutations and sales tools out of this profile until their dedicated workflows are implemented. Compact purchase/build order reads and sourcing tools are supported.
 
 ## Implementation notes
 

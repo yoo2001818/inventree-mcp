@@ -7,7 +7,9 @@ import { registerPartPrimitives } from "./write/partPrimitives.js";
 import { registerInventoryPlanTools } from "./write/planTools.js";
 import { MutationPrimitiveRegistry } from "./write/shared.js";
 import { registerStockPrimitives } from "./write/stockPrimitives.js";
+import { registerStockEditing } from "./write/stockEditing.js";
 import { registerStructurePrimitives } from "./write/structurePrimitives.js";
+import { registerCatalogPrimitives } from "./write/catalogPrimitives.js";
 
 export function registerWriteTools(
   server: McpServer,
@@ -17,8 +19,10 @@ export function registerWriteTools(
   const primitives = new MutationPrimitiveRegistry();
 
   registerPartPrimitives(primitives, oauth);
+  registerCatalogPrimitives(primitives, oauth);
   registerImageWriteTools(server, primitives, oauth, imageUploads);
   registerStockPrimitives(primitives, oauth);
+  registerStockEditing(primitives, oauth);
   registerStructurePrimitives(primitives, oauth);
   registerLabelPrimitives(primitives, oauth);
   registerInventoryPlanTools(server, oauth, imageUploads, primitives);

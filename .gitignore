@@ -6,3 +6,5 @@ data/
 *.log
 .DS_Store
 docs-dropin/
+
+.e2e/

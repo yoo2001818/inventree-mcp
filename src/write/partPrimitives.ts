@@ -10,7 +10,8 @@ import {
 } from "../inventoryDomain.js";
 import type { PlannedOutputInput } from "../mutationPlans.js";
 import type { OAuthService } from "../oauth.js";
-import { clientFor, safely, WRITE_SECURITY } from "../mcpSupport.js";
+import { clientFor, result, safely, WRITE_SECURITY } from "../mcpSupport.js";
+import { CatalogContext } from "./catalogPrimitives.js";
 import type { MutationRequest } from "../store.js";
 import {
   MutationPrimitiveRegistry,
@@ -22,7 +23,6 @@ import {
   entityIdSchema,
   getCategory,
   getLocation,
-  getPart,
   metadataBoolean,
   mutationAnnotations,
   mutationPath,
@@ -62,6 +62,9 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
           maximum_stock: z.number().nonnegative().default(0),
           default_location_id: nullableEntityIdSchema().optional(),
           trackable: z.boolean().default(false),
+          assembly: z.boolean().default(false),
+          component: z.boolean().default(true),
+          purchaseable: z.boolean().default(true),
           link: z.string().url().max(2000).nullable().optional(),
           notes: optionalText(),
         }),
@@ -134,9 +137,9 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
           minimum_stock: input.part.minimum_stock,
           maximum_stock: input.part.maximum_stock,
           active: true,
-          assembly: false,
-          component: true,
-          purchaseable: true,
+          assembly: input.part.assembly,
+          component: input.part.component,
+          purchaseable: input.part.purchaseable,
           salable: false,
           virtual: false,
           trackable: input.part.trackable,
@@ -183,6 +186,7 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
           ...(input.part.minimum_stock ? [`- Minimum stock: ${input.part.minimum_stock}`] : []),
           ...(input.part.maximum_stock ? [`- Maximum stock: ${input.part.maximum_stock}`] : []),
           ...(input.part.trackable ? ["- Trackable: yes"] : []),
+          `- Assembly: ${input.part.assembly}; component: ${input.part.component}; purchaseable: ${input.part.purchaseable}`,
           ...(defaultLocationId !== undefined && defaultLocationId !== null
             ? [`- Default location: ${plannedLabel(defaultLocationOutput, formatRef(refOrFallback(defaultLocation, "Location", Number(defaultLocationId))))}`]
             : []),
@@ -209,7 +213,7 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
             requestIndex: 0,
             responsePaths: [["pk"]],
             display: input.part.name,
-            metadata: { name: input.part.name, units: input.part.units ?? null, locked: false },
+            metadata: { ...partBody, units: input.part.units ?? null, locked: false },
           },
           ...(input.initial_stock
             ? [{
@@ -254,7 +258,10 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
           tags: z.array(z.string()).optional(),
           active: z.boolean().optional(),
           trackable: z.boolean().optional(),
-        }),
+          assembly: z.boolean().optional(),
+          component: z.boolean().optional(),
+          purchaseable: z.boolean().optional(),
+        }).strict(),
       },
       annotations: mutationAnnotations(true),
       _meta: { securitySchemes: WRITE_SECURITY },
@@ -266,8 +273,9 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
         const { auth, client } = clientFor(oauth, extra.authInfo, "inventree.write");
         await validatePartUnits(client, changes.units);
         const partOutput = plannedOutput(oauth, auth, input.plan_id, part_id, "part");
-        const part = typeof part_id === "number" ? await getPart(client, part_id) : undefined;
-        if (part) ensureUnlocked(part);
+        const context = new CatalogContext(oauth, auth, client, input.plan_id);
+        const part = (await context.entity("part", part_id)).data;
+        ensureUnlocked(part);
         let category: JsonRecord | undefined;
         const categoryId = changes.category_id === null || changes.category_id === undefined
           ? changes.category_id
@@ -311,6 +319,9 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
           ["tags", "tags", "Tags"],
           ["active", "active", "Active"],
           ["trackable", "trackable", "Trackable"],
+          ["assembly", "assembly", "Assembly"],
+          ["component", "component", "Component"],
+          ["purchaseable", "purchaseable", "Purchaseable"],
         ];
         const body: Record<string, unknown> = {};
         const diffs: string[] = [];
@@ -322,7 +333,7 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
             : inputKey === "default_location_id"
               ? locationId
               : value;
-          body[upstreamKey] = inputKey === "category_id" || inputKey === "default_location_id"
+          const upstreamValue = inputKey === "category_id" || inputKey === "default_location_id"
             ? mutationValue(normalizedValue as EntityId | null)
             : normalizedValue;
           const displayValue = categoryOutput && inputKey === "category_id"
@@ -330,32 +341,27 @@ export function registerPartPrimitives(primitives: MutationPrimitiveRegistry, oa
             : locationOutput && inputKey === "default_location_id"
               ? locationOutput.display
               : normalizedValue;
-          const diff = part
-            ? beforeAfter(label, part[upstreamKey], displayValue)
-            : `- ${label}: assigned at commit -> ${JSON.stringify(displayValue)}`;
-          if (diff) diffs.push(diff);
+          const diff = beforeAfter(label, part[upstreamKey], displayValue);
+          if (diff) { body[upstreamKey] = upstreamValue; diffs.push(diff); }
         }
         if (changes.keywords !== undefined) {
-          body.keywords = changes.keywords.join(", ");
-          const diff = part
-            ? beforeAfter("Keywords", part.keywords, body.keywords)
-            : `- Keywords: assigned at commit -> ${JSON.stringify(body.keywords)}`;
-          if (diff) diffs.push(diff);
+          const keywords = changes.keywords.join(", ");
+          const diff = beforeAfter("Keywords", part.keywords, keywords);
+          if (diff) { body.keywords = keywords; diffs.push(diff); }
         }
-        if (!Object.keys(body).length) throw new Error("At least one part change is required");
-        if (!diffs.length) throw new Error("The requested part values are already current");
+        if (!Object.keys(changes).length) throw new Error("At least one part change is required");
+        if (!diffs.length) return result({ status: "already_current", part_id }, "The requested part metadata is already current; no plan step was created.");
         const checkPaths: Array<[string, Record<string, unknown>?]> = [];
-        if (typeof part_id === "number") checkPaths.push([`/api/part/${part_id}/`, { category_detail: true, location_detail: true }]);
         if (typeof categoryId === "number") checkPaths.push([`/api/part/category/${categoryId}/`, { path_detail: true }]);
         if (typeof locationId === "number") checkPaths.push([`/api/stock/location/${locationId}/`, { path_detail: true }]);
-        const summary = [`Update ${plannedLabel(partOutput, formatRef(part ? partRef(part) : undefined))}:`, ...diffs].join("\n");
+        const summary = [`Update ${plannedLabel(partOutput, formatRef(partRef(part)))}:`, ...diffs].join("\n");
         return stageMutation(
           oauth,
           auth,
           input,
           summary,
           [{ method: "PATCH", path: mutationPath("/api/part/", part_id), body }],
-          await checksFor(client, checkPaths),
+          [...context.checks, ...await checksFor(client, checkPaths)],
         );
       }),
   );

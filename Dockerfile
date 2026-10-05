@@ -16,6 +16,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY skills/inventree-inventory ./skills/inventree-inventory
 
 RUN mkdir -p /data && chown node:node /data
 USER node

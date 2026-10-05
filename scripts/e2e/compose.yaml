@@ -1,0 +1,83 @@
+name: inventree-mcp-e2e
+
+x-inventree: &inventree
+  image: ${INVENTREE_IMAGE:?Run the e2e setup script first}
+  env_file: ../../.e2e/stack.env
+  volumes:
+    - inventree-data:/home/inventree/data
+  depends_on:
+    db:
+      condition: service_healthy
+    cache:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: inventree_e2e
+      POSTGRES_USER: inventree_e2e
+      POSTGRES_PASSWORD: ${INVENTREE_DB_PASSWORD:?Run the e2e setup script first}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U inventree_e2e -d inventree_e2e']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  cache:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  server:
+    <<: *inventree
+    healthcheck:
+      test: [CMD-SHELL, 'invoke server-health --address http://localhost:8000']
+      interval: 5s
+      timeout: 10s
+      start_period: 60s
+      retries: 30
+  worker:
+    <<: *inventree
+    command: invoke worker
+    depends_on:
+      server:
+        condition: service_healthy
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - '127.0.0.1:${E2E_INVENTREE_PORT:-18000}:80'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - inventree-data:/home/inventree/data:ro
+    depends_on:
+      server:
+        condition: service_healthy
+  mcp:
+    build:
+      context: ../..
+    env_file: ../../.e2e/stack.env
+    environment:
+      INVENTREE_URL: http://proxy
+      BIND_HOST: 0.0.0.0
+      PORT: 3000
+      DATA_FILE: /data/state.json
+      ENABLE_RAW_WRITE: 'false'
+    ports:
+      - '127.0.0.1:${E2E_MCP_PORT:-18300}:3000'
+    volumes:
+      - mcp-data:/data
+    depends_on:
+      server:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+
+volumes:
+  database:
+  inventree-data:
+  mcp-data:

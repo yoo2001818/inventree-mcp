@@ -1,0 +1,14 @@
+:80 {
+    handle_path /static/* {
+        root * /home/inventree/data/static
+        file_server
+    }
+    handle_path /media/* {
+        forward_auth server:8000 {
+            uri /auth/
+        }
+        root * /home/inventree/data/media
+        file_server
+    }
+    reverse_proxy server:8000
+}
